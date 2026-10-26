@@ -1,0 +1,9 @@
+python/
+venv/
+models/
+cache/
+soundfonts/*.sf2
+projects/
+settings.json
+__pycache__/
+*.pyc

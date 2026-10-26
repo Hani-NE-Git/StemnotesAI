@@ -1,0 +1,9 @@
+# Core app (light): UI, audio output, SoundFont synth, VST3 hosting, MIDI export
+PySide6-Essentials>=6.6
+numpy>=1.26
+sounddevice>=0.4.6
+soundfile>=0.12
+soxr>=0.3
+pedalboard>=0.9.14
+mido>=1.3
+# tinysoundfont is installed separately with --no-deps (its pyaudio dependency is not needed)
