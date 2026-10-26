@@ -345,7 +345,8 @@ class UpdateDialog(QDialog):
         self.setWindowTitle("Обновление StemNotes")
         self.resize(520, 260)
         lay = QVBoxLayout(self)
-        self.info = QLabel(f"Источник: github.com/{repo} (ветка {branch})\nТекущая версия: {updater.local_version()}\n"
+        mode = "git (приватный репозиторий, без токена)" if updater.git_available() else "zip-архив"
+        self.info = QLabel(f"Источник: github.com/{repo} (ветка {branch}), способ: {mode}\nТекущая версия: {updater.local_version()}\n"
                            "Обновляется только код программы. Python, модели, SoundFont и проекты остаются.")
         self.info.setWordWrap(True)
         lay.addWidget(self.info)
@@ -399,7 +400,8 @@ class UpdateDialog(QDialog):
         self.msg.setText(m)
         if self._error is not None:
             self.timer.stop()
-            self.msg.setText("Ошибка: " + self._error + "\n\nЕсли репозиторий приватный, добавьте github_token в settings.json.")
+            self.msg.setText("Ошибка: " + self._error + "\n\nДля приватного репозитория нужен git в системе (обновление через git) "
+                             "или github_token в settings.json (обновление через zip).")
             self.check_btn.setEnabled(True)
             self.force_btn.setEnabled(True)
         elif self._result is not None:

@@ -1,5 +1,10 @@
 """Self-update from GitHub: replaces only the program code, never python/, models/, soundfonts/, projects/, cache/.
 
+Two modes:
+  * git mode (preferred, works with private repos without storing any token): the app folder is a git clone
+    and `git` is installed -> fetch + fast-forward pull. Authentication is handled by Git Credential Manager.
+  * zip mode: download the branch archive (public repo, or private repo with github_token in settings.json).
+
 Usage from the app (toolbar "Обновить") or standalone:  python -m stemnotes.updater [--force] [--check]
 """
 from __future__ import annotations
@@ -173,8 +178,63 @@ def install_requirements(progress: Progress, ai: bool | None = None) -> None:
         subprocess.run(cmd, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
+def _git() -> str | None:
+    return shutil.which("git")
+
+
+def git_available() -> bool:
+    return (paths.HOME / ".git").exists() and _git() is not None
+
+
+def _run_git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([_git(), "-C", str(paths.HOME), *args], capture_output=True, text=True,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def update_via_git(force: bool, progress: Progress) -> dict:
+    repo, branch, _ = repo_config()
+    home = paths.HOME
+    local = local_version()
+    before = {f: _file_hash(home / f) for f in REQ_FILES}
+    progress(0.05, f"git fetch origin {branch}…")
+    # make sure origin points at the configured repo
+    r = _run_git("remote", "get-url", "origin")
+    if r.returncode != 0:
+        _run_git("remote", "add", "origin", f"https://github.com/{repo}.git")
+    r = _run_git("fetch", "origin", branch)
+    if r.returncode != 0:
+        raise RuntimeError("git fetch не удался:\n" + (r.stderr or r.stdout).strip())
+    head = _run_git("rev-parse", "HEAD").stdout.strip()
+    remote = _run_git("rev-parse", "FETCH_HEAD").stdout.strip()
+    if head == remote and not force:
+        progress(1.0, f"Установлена актуальная версия {local} (git {head[:7]})")
+        return {"updated": False, "local": local, "remote": local, "changed": []}
+    progress(0.4, "Применение изменений (git)…")
+    changed = [l for l in _run_git("diff", "--name-status", "HEAD", "FETCH_HEAD").stdout.splitlines() if l.strip()]
+    if force:
+        r = _run_git("reset", "--hard", "FETCH_HEAD")
+    else:
+        r = _run_git("merge", "--ff-only", "FETCH_HEAD")
+        if r.returncode != 0:
+            # local edits in the way: keep them aside and take the remote version
+            _run_git("stash", "push", "-u", "-m", "stemnotes-updater")
+            r = _run_git("reset", "--hard", "FETCH_HEAD")
+    if r.returncode != 0:
+        raise RuntimeError("git не смог применить обновление:\n" + (r.stderr or r.stdout).strip())
+    for p in (home / "stemnotes").rglob("__pycache__"):
+        shutil.rmtree(p, ignore_errors=True)
+    after = {f: _file_hash(home / f) for f in REQ_FILES}
+    if before != after:
+        install_requirements(progress)
+    new_local = local_version()
+    progress(1.0, f"Обновлено: {local} → {new_local} (git {remote[:7]}), файлов изменено: {len(changed)}")
+    return {"updated": True, "local": local, "remote": new_local, "changed": changed}
+
+
 def update(force: bool = False, progress: Progress = lambda f, m: None) -> dict:
     """Full update. Returns {'updated': bool, 'local': str, 'remote': str, 'changed': [...]}"""
+    if git_available():
+        return update_via_git(force, progress)
     repo, branch, token = repo_config()
     local = local_version()
     progress(0.0, f"Проверка версии ({repo}, ветка {branch})…")
@@ -194,7 +254,8 @@ def main(argv: list[str]) -> int:
     force = "--force" in argv
     if "--check" in argv:
         repo, branch, token = repo_config()
-        print("local:", local_version(), "remote:", remote_version(repo, branch, token))
+        print("mode:", "git" if git_available() else "zip")
+        print("local:", local_version(), "remote:", remote_version(repo, branch, token) if not git_available() else "(git)")
         return 0
     try:
         res = update(force=force, progress=lambda f, m: print(f"[{int(f * 100):3d}%] {m}"))

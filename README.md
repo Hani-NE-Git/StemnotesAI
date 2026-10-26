@@ -104,8 +104,19 @@ MIDI-дорожки** — поле «Фон:» в строке дорожки с
 - или `update.bat` (Linux: `./update.sh`), ключ `--force` переустанавливает код той же версии.
 
 Если изменились файлы `requirements-*.txt`, обновятся и библиотеки (pip докачивает только новое).
-Для приватного репозитория добавьте в `settings.json` строку `"github_token": "ghp_..."`.
-Другой репозиторий/ветка: `"github_repo": "owner/repo"`, `"github_branch": "main"`.
+
+Репозиторий **приватный**, поэтому обновление идёт через установленный в системе git
+(`git fetch` + `git merge --ff-only`, авторизация через Git Credential Manager, токены нигде не хранятся).
+Если git не установлен, используется запасной способ: скачивание zip-архива, для приватного репозитория
+нужен токен в `settings.json`: `"github_token": "github_pat_..."` (fine-grained token, доступ только
+Contents: Read к этому репозиторию). Другой репозиторий/ветка: `"github_repo": "owner/repo"`, `"github_branch": "main"`.
+
+Первая отправка кода в репозиторий (один раз, из папки программы):
+
+```
+git remote add origin https://github.com/Hani-NE-Git/stemnotes.git
+git push -u origin main
+```
 
 ## Папки
 
