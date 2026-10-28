@@ -13,7 +13,10 @@ from typing import Callable
 import numpy as np
 
 from .. import paths
+from ..log import get as _get_log
 from ..project import GhostNote, PitchImage, PITCH_LOW, PITCH_HIGH, N_PITCHES
+
+log = _get_log("engines")
 
 PITCHED_ROLES = ["mix", "bass", "guitar", "piano", "vocals", "other"]
 
@@ -250,10 +253,33 @@ def muscriptor_events_to_ghosts(events) -> dict[str, list[GhostNote]]:
     return by_group
 
 
+def gate_silence(mono: np.ndarray, sr: int, floor_db: float = -45.0) -> tuple[np.ndarray, float]:
+    """Zero out parts of a stem that are practically silent (bleed from other instruments), so a model that is
+    forced to output this instrument does not invent notes there. Returns (gated audio, fraction kept)."""
+    x = mono.astype(np.float32)
+    win = max(1, int(0.02 * sr))
+    n = len(x) // win
+    if n == 0:
+        return x, 1.0
+    rms = np.sqrt((x[:n * win].reshape(n, win) ** 2).mean(axis=1) + 1e-12)
+    ref = float(np.percentile(rms, 95)) + 1e-9
+    keep = rms > ref * (10 ** (floor_db / 20.0))
+    # dilate by 100 ms so attacks and tails survive
+    k = np.convolve(keep.astype(np.float32), np.ones(11), mode="same") > 0
+    mask = np.repeat(k, win)
+    out = x.copy()
+    out[:len(mask)] *= mask
+    if len(mask) < len(out):
+        out[len(mask):] = 0
+    return out, float(k.mean())
+
+
 def run_muscriptor_mix(path: Path, mono: np.ndarray, sr: int, role: str) -> dict[str, tuple[list[GhostNote], PitchImage | None]]:
     """One pass over the whole song; notes are routed to stems by the instrument the model assigned."""
     model = _muscriptor_model()
+    log.info("MuScriptor (whole song): transcribing %s", path)
     by_group = muscriptor_events_to_ghosts(model.transcribe(str(path)))
+    log.info("MuScriptor (whole song): notes per instrument group: %s", {k: len(v) for k, v in by_group.items()})
     out: dict[str, list[GhostNote]] = {"mix": []}
     for group, ghosts in by_group.items():
         out["mix"].extend(ghosts)
@@ -287,12 +313,19 @@ def stem_energy_confidence(ghosts: list[GhostNote], stem_mono: np.ndarray, sr: i
 
 
 def run_muscriptor_stem(path: Path, mono: np.ndarray, sr: int, role: str):
-    """Transcribe one separated stem, constrained to that stem's instrument groups."""
+    """Transcribe ONE separated stem file, constrained to that stem's instrument groups.
+    Silent parts of the stem are zeroed first so the model cannot invent notes from bleed."""
+    import torch
     model = _muscriptor_model()
     groups = MUSC_ROLE_TO_GROUPS.get(role)
-    by_group = muscriptor_events_to_ghosts(model.transcribe(str(path), instruments=groups))
+    gated, kept = gate_silence(mono, sr)
+    log.info("MuScriptor (stem) role=%s file=%s instruments=%s audible=%.0f%%", role, path, groups, kept * 100)
+    audio = (torch.from_numpy(gated)[None, :], sr)      # the stem only, never the full mix
+    by_group = muscriptor_events_to_ghosts(model.transcribe(audio, instruments=groups))
     ghosts = [g for lst in by_group.values() for g in lst]
     ghosts.sort(key=lambda x: x.start)
+    stem_energy_confidence(ghosts, mono, sr)
+    log.info("MuScriptor (stem) role=%s: %d notes, groups %s", role, len(ghosts), {k: len(v) for k, v in by_group.items()})
     return ghosts, None
 
 
@@ -330,9 +363,18 @@ def engine_color(engine_id: str) -> tuple[int, int, int]:
 
 
 def run_engine(engine: Engine, path: Path, mono: np.ndarray, sr: int, role: str, errors: list[str] | None = None):
+    import time
+    t0 = time.time()
     try:
-        return engine.run(path, mono, sr, role)
+        log.info("engine %s start: role=%s file=%s", engine.id, role, path)
+        result = engine.run(path, mono, sr, role)
+        if engine.multi_role:
+            log.info("engine %s done in %.1fs: %s", engine.id, time.time() - t0, {r: len(v[0]) for r, v in result.items()})
+        else:
+            log.info("engine %s done in %.1fs: role=%s notes=%d", engine.id, time.time() - t0, role, len(result[0]))
+        return result
     except Exception as e:
+        log.exception("engine %s failed (role=%s)", engine.id, role)
         traceback.print_exc()
         if errors is not None:
             msg = str(e).strip().splitlines()

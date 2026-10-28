@@ -12,7 +12,10 @@ import numpy as np
 
 from ..project import Project, Track, TRACK_COLORS
 from ..audio.loader import load_audio, clear_cache
+from ..log import get as _get_log
 from . import features
+
+log = _get_log("pipeline")
 
 STEM_ORDER = ["drums", "bass", "guitar", "piano", "vocals", "other"]
 STEM_LABELS = {"mix": "Оригинал", "drums": "Ударные", "bass": "Бас", "guitar": "Гитара", "piano": "Пианино",
@@ -92,10 +95,10 @@ def ensure_audio_track(project: Project, role: str, path: Path, name: str) -> Tr
 
 
 def ensure_default_midi_tracks(project: Project, stems: list[str]) -> None:
-    if project.midi_tracks():
-        return
+    """One MIDI track per stem that has none yet (proper instrument and background source)."""
+    have = {t.ghost_source for t in project.midi_tracks()}
     for role in STEM_ORDER:
-        if role not in stems or role not in DEFAULT_MIDI:
+        if role not in stems or role not in DEFAULT_MIDI or role in have:
             continue
         name, program, drums = DEFAULT_MIDI[role]
         t = Track(name=name, kind="midi", instrument={"type": "sf2", "bank": 0, "program": program, "drums": drums},
@@ -110,6 +113,7 @@ def run_analysis(project: Project, opt: AnalysisOptions, progress: Callable[[flo
         raise FileNotFoundError("Файл песни не найден")
     an = project.analysis
     an.dir.mkdir(parents=True, exist_ok=True)
+    log.info("=== analysis start: project=%s song=%s options=%s", project.dir, song, opt)
 
     progress(0.0, "Загрузка песни…")
     audio = load_audio(song, 44100)                         # (n,2)
@@ -176,6 +180,8 @@ def run_analysis(project: Project, opt: AnalysisOptions, progress: Callable[[flo
         chosen = [e for e in ENGINES if e.available() and (opt.engines is None and e.default_on or opt.engines is not None and e.id in opt.engines)]
         jobs = [(e, role) for e in chosen for role in sources if role in e.roles and not e.multi_role]
         an.warnings = []
+        an.summary = []
+        log.info("engines selected: %s; stems available: %s", [e.id for e in chosen], sorted(stems))
         multi = [e for e in chosen if e.multi_role]
         for eng in multi:
             check()
@@ -188,6 +194,7 @@ def run_analysis(project: Project, opt: AnalysisOptions, progress: Callable[[flo
                 if role != "mix" and role in sources and role in stems:
                     stem_energy_confidence(ghosts, sources[role], features.ANALYSIS_SR)
                 an.ghosts[f"{role}:{eng.id}"] = ghosts
+                an.summary.append(f"{eng.name} → {STEM_LABELS.get(role, role)}: {len(ghosts)} нот")
                 if heat is not None:
                     an.images[f"heat:{role}:{eng.id}"] = heat
         for i, (eng, role) in enumerate(jobs):
@@ -198,6 +205,7 @@ def run_analysis(project: Project, opt: AnalysisOptions, progress: Callable[[flo
                 continue
             ghosts, heat = run_engine(eng, path, sources[role], features.ANALYSIS_SR, role, an.warnings)
             an.ghosts[f"{role}:{eng.id}"] = ghosts
+            an.summary.append(f"{eng.name} → {STEM_LABELS.get(role, role)} ({path.name}): {len(ghosts)} нот")
             if heat is not None:
                 an.images[f"heat:{role}:{eng.id}"] = heat
             elif f"heat:{role}:{eng.id}" in an.images:
@@ -207,6 +215,7 @@ def run_analysis(project: Project, opt: AnalysisOptions, progress: Callable[[flo
     progress(0.99, "Сохранение…")
     an.save()
     project.save()
+    log.info("=== analysis done; warnings=%d", len(an.warnings))
     progress(1.0, "Готово")
 
 

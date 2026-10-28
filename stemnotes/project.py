@@ -116,6 +116,7 @@ class Analysis:
         self.beats: list[float] = []
         self.sources: list[str] = []              # roles that have data (mix, bass, drums, ...)
         self.warnings: list[str] = []             # last analysis run problems (not saved)
+        self.summary: list[str] = []              # last analysis run: notes per engine/stem (not saved)
 
     def load(self) -> None:
         meta = self.dir / "analysis.json"

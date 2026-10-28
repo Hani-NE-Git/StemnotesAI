@@ -194,6 +194,10 @@ class AnalysisDialog(QDialog):
         lay.addWidget(self.bar)
         lay.addWidget(self.msg)
         row = QHBoxLayout()
+        log_btn = QPushButton("Открыть журнал")
+        log_btn.setToolTip("logs\\stemnotes.log — что делал каждый движок, какие файлы получал, ошибки")
+        log_btn.clicked.connect(self._open_log)
+        row.addWidget(log_btn)
         self.start_btn = QPushButton("Запустить")
         self.start_btn.clicked.connect(self._start)
         self.cancel_btn = QPushButton("Отмена")
@@ -208,6 +212,13 @@ class AnalysisDialog(QDialog):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._poll)
         threading.Thread(target=self._probe_gpu, daemon=True).start()
+
+    def _open_log(self) -> None:
+        from ..log import LOG_FILE, setup
+        setup()
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(LOG_FILE)))
 
     def _probe_gpu(self) -> None:
         try:
@@ -228,9 +239,14 @@ class AnalysisDialog(QDialog):
             err = self._done
             if err is None:
                 warns = list(getattr(self.project.analysis, "warnings", []))
+                summary = list(getattr(self.project.analysis, "summary", []))
+                from ..log import LOG_FILE
                 if warns:
                     text = "\n\n".join(w if len(w) < 900 else w[:900] + "…" for w in dict.fromkeys(warns))
-                    QMessageBox.warning(self, "Анализ завершён с замечаниями", "Часть движков не отработала:\n\n" + text)
+                    QMessageBox.warning(self, "Анализ завершён с замечаниями", "Часть движков не отработала:\n\n" + text +
+                                        f"\n\nПодробности: {LOG_FILE}")
+                elif summary:
+                    QMessageBox.information(self, "Анализ завершён", "Найдено нот:\n" + "\n".join(summary) + f"\n\nЖурнал: {LOG_FILE}")
                 self.finished_ok.emit()
                 self.accept()
             else:

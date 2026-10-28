@@ -36,6 +36,9 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     app = QApplication(argv)
     app.setApplicationName("StemNotes")
+    from . import __version__
+    from .log import setup as setup_log
+    setup_log().info("StemNotes %s starting, home=%s", __version__, paths.HOME)
     dark_palette(app)
 
     from .ui.main_window import MainWindow, load_settings
