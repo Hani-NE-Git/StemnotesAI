@@ -10,7 +10,7 @@
 
 ## Скачать
 
-Страница проекта: https://github.com/Hani-NE-Git/stemnotes → зелёная кнопка **Code → Download ZIP**.
+Страница проекта: https://github.com/Hani-NE-Git/PyTest → зелёная кнопка **Code → Download ZIP**.
 Git не нужен. Лицензия MIT.
 
 ## Установка (Windows, всё в одной папке, например `D:\StemNotes`)
@@ -133,7 +133,7 @@ MIDI-дорожки** — поле «Фон:» в строке дорожки с
 
 ## Обновление
 
-Код программы обновляется из GitHub (`Hani-NE-Git/stemnotes`), **не трогая** `python\`, `models\`,
+Код программы обновляется из GitHub (`Hani-NE-Git/PyTest`), **не трогая** `python\`, `models\`,
 `soundfonts\`, `projects\`, `cache\` и `settings.json`:
 
 - в программе: кнопка **«Обновить»** → «Проверить и обновить» → «Перезапустить программу»;
