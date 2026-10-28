@@ -201,10 +201,13 @@ def update_via_git(force: bool, progress: Progress) -> dict:
     local = local_version()
     before = {f: _file_hash(home / f) for f in REQ_FILES}
     progress(0.05, f"git fetch origin {branch}…")
-    # make sure origin points at the configured repo
+    # make sure origin points at the configured repo (self-heals an old/renamed address)
+    want = f"https://github.com/{repo}.git"
     r = _run_git("remote", "get-url", "origin")
     if r.returncode != 0:
-        _run_git("remote", "add", "origin", f"https://github.com/{repo}.git")
+        _run_git("remote", "add", "origin", want)
+    elif repo.lower() not in r.stdout.strip().lower():
+        _run_git("remote", "set-url", "origin", want)
     r = _run_git("fetch", "origin", branch)
     if r.returncode != 0:
         raise RuntimeError("git fetch не удался:\n" + (r.stderr or r.stdout).strip())
