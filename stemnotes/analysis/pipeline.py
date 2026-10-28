@@ -35,6 +35,7 @@ class AnalysisOptions:
     spectrograms: bool = True
     transcribe: bool = True
     model: str = "htdemucs_6s"
+    engines: list[str] | None = None     # engine ids; None = all available engines that are on by default
 
 
 class CancelledError(Exception):
@@ -169,32 +170,35 @@ def run_analysis(project: Project, opt: AnalysisOptions, progress: Callable[[flo
             except Exception:
                 traceback.print_exc()
 
-    # ---- transcription
+    # ---- transcription with the selected engines
     if opt.transcribe:
-        from .transcribe import transcribe_pitched, transcribe_drums
-        pitched = [r for r in sources if r != "drums"]
-        n = len(pitched) + (1 if "drums" in sources else 0)
-        i = 0
-        for role in pitched:
+        from .engines import ENGINES, run_engine
+        chosen = [e for e in ENGINES if e.available() and (opt.engines is None and e.default_on or opt.engines is not None and e.id in opt.engines)]
+        jobs = [(e, role) for e in chosen for role in sources if role in e.roles and not e.multi_role]
+        multi = [e for e in chosen if e.multi_role]
+        for eng in multi:
             check()
-            progress(0.65 + 0.33 * i / n, f"Поиск нот: {STEM_LABELS.get(role, role)}…")
+            progress(0.65, f"{eng.name}…")
+            errors = []
+            result = run_engine(eng, song, sources["mix"], features.ANALYSIS_SR, "mix")
+            if isinstance(result, tuple):
+                result = {}
+            for role, (ghosts, heat) in result.items():
+                an.ghosts[f"{role}:{eng.id}"] = ghosts
+                if heat is not None:
+                    an.images[f"heat:{role}:{eng.id}"] = heat
+        for i, (eng, role) in enumerate(jobs):
+            check()
+            progress(0.65 + 0.33 * i / max(1, len(jobs)), f"{eng.name}: {STEM_LABELS.get(role, role)}…")
             path = song if role == "mix" else stems.get(role)
             if path is None:
                 continue
-            try:
-                ghosts, heat = transcribe_pitched(path)
-                an.ghosts[role] = ghosts
-                an.images[f"heat:{role}"] = heat
-            except Exception:
-                traceback.print_exc()
-            i += 1
-        if "drums" in sources:
-            check()
-            progress(0.65 + 0.33 * i / n, "Поиск ударов…")
-            try:
-                an.ghosts["drums"] = transcribe_drums(sources["drums"], features.ANALYSIS_SR)
-            except Exception:
-                traceback.print_exc()
+            ghosts, heat = run_engine(eng, path, sources[role], features.ANALYSIS_SR, role)
+            an.ghosts[f"{role}:{eng.id}"] = ghosts
+            if heat is not None:
+                an.images[f"heat:{role}:{eng.id}"] = heat
+            elif f"heat:{role}:{eng.id}" in an.images:
+                del an.images[f"heat:{role}:{eng.id}"]
 
     ensure_default_midi_tracks(project, list(sources.keys()))
     progress(0.99, "Сохранение…")

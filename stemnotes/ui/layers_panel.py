@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBo
 
 from .piano_roll import Layer, LayerSettings
 from .track_panel import SOURCE_LABELS
+from ..analysis.engines import ENGINE_BY_ID, engine_color
 
 
 class LayerRow(QWidget):
@@ -82,6 +83,22 @@ class LayersPanel(QWidget):
         g.addRow(self.labels)
         lay.addWidget(gbox)
 
+        self.eng_box = QGroupBox("Движки подбора (цвет = движок)")
+        self.eng_lay = QVBoxLayout(self.eng_box)
+        self.eng_checks: dict[str, QCheckBox] = {}
+        self.heat_combo = QComboBox()
+        self.heat_combo.setToolTip("Чью карту вероятностей рисовать в слое «ИИ-вероятности»")
+        self.heat_combo.currentIndexChanged.connect(self._on_heat_engine)
+        hrow = QHBoxLayout()
+        hrow.addWidget(QLabel("Карта:"))
+        hrow.addWidget(self.heat_combo, 1)
+        self.eng_lay.addLayout(hrow)
+        self.eng_hint = QLabel("Запустите «ИИ-анализ», чтобы появились кандидаты нот.")
+        self.eng_hint.setStyleSheet("color:#8a93a5;")
+        self.eng_hint.setWordWrap(True)
+        self.eng_lay.addWidget(self.eng_hint)
+        lay.addWidget(self.eng_box)
+
         help_lbl = QLabel(
             "<b>Управление</b><br>"
             "ЛКМ по пустому — новая нота, тяни — длина<br>"
@@ -109,6 +126,42 @@ class LayersPanel(QWidget):
         idx = self.source.findData(cur)
         self.source.setCurrentIndex(max(0, idx))
         self.source.blockSignals(False)
+
+    def set_engines(self, engine_ids: list[str]) -> None:
+        """Rebuild the per-engine checkboxes from the engines present in the analysis."""
+        for cb in self.eng_checks.values():
+            self.eng_lay.removeWidget(cb)
+            cb.deleteLater()
+        self.eng_checks.clear()
+        self.eng_hint.setVisible(not engine_ids)
+        for eid in engine_ids:
+            e = ENGINE_BY_ID.get(eid)
+            r, g, b = engine_color(eid)
+            cb = QCheckBox(e.name if e else eid)
+            cb.setStyleSheet(f"QCheckBox{{color:rgb({r},{g},{b});}}")
+            cb.setToolTip(e.description if e else "")
+            cb.setChecked(self.s.ghost_engines is None or eid in self.s.ghost_engines)
+            cb.toggled.connect(self._on_engines)
+            self.eng_checks[eid] = cb
+            self.eng_lay.addWidget(cb)
+        self.heat_combo.blockSignals(True)
+        self.heat_combo.clear()
+        self.heat_combo.addItem("Авто", None)
+        for eid in engine_ids:
+            e = ENGINE_BY_ID.get(eid)
+            self.heat_combo.addItem(e.name if e else eid, eid)
+        idx = self.heat_combo.findData(self.s.heat_engine)
+        self.heat_combo.setCurrentIndex(max(0, idx))
+        self.heat_combo.blockSignals(False)
+
+    def _on_engines(self, _v=None) -> None:
+        on = {eid for eid, cb in self.eng_checks.items() if cb.isChecked()}
+        self.s.ghost_engines = None if len(on) == len(self.eng_checks) else on
+        self._emit()
+
+    def _on_heat_engine(self, _i) -> None:
+        self.s.heat_engine = self.heat_combo.currentData()
+        self._emit()
 
     def _on_source(self, _i) -> None:
         self.s.source = self.source.currentData() or "auto"

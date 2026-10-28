@@ -171,6 +171,7 @@ def install_requirements(progress: Progress, ai: bool | None = None) -> None:
         except Exception:
             ai = False
     if ai:
+        cmds.append([py, "-m", "pip", "install", "--no-warn-script-location", "-q", "torchaudio"])
         cmds.append([py, "-m", "pip", "install", "--no-warn-script-location", "-q", "-r", str(home / "requirements-ai.txt")])
         cmds.append([py, "-m", "pip", "install", "--no-warn-script-location", "-q", "--no-deps", "basic-pitch"])
     for i, cmd in enumerate(cmds):

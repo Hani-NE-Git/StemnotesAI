@@ -123,12 +123,51 @@ class Analysis:
         d = json.loads(meta.read_text(encoding="utf-8"))
         self.beats = d.get("beats", [])
         self.sources = d.get("sources", [])
-        self.ghosts = {k: [GhostNote(*g) for g in v] for k, v in d.get("ghosts", {}).items()}
+        self.ghosts = {self._migrate_ghost_key(k): [GhostNote(*g) for g in v] for k, v in d.get("ghosts", {}).items()}
         for key, info in d.get("images", {}).items():
             f = self.dir / info["file"]
             if f.exists():
                 arr = np.load(f)["data"]
-                self.images[key] = PitchImage(arr, info["t0"], info["dt"], info["pitch_low"], info["rows_per_semitone"])
+                self.images[self._migrate_image_key(key)] = PitchImage(arr, info["t0"], info["dt"], info["pitch_low"], info["rows_per_semitone"])
+
+    @staticmethod
+    def _migrate_ghost_key(key: str) -> str:
+        """v0.2 stored ghosts per role ("bass"); v0.3 stores per role and engine ("bass:basic_pitch")."""
+        if ":" in key:
+            return key
+        return f"{key}:drums_heuristic" if key == "drums" else f"{key}:basic_pitch"
+
+    @staticmethod
+    def _migrate_image_key(key: str) -> str:
+        parts = key.split(":")
+        if parts[0] == "heat" and len(parts) == 2:
+            return f"heat:{parts[1]}:basic_pitch"
+        return key
+
+    def ghosts_for(self, role: str, engines: set[str] | None = None) -> list[tuple[str, list[GhostNote]]]:
+        """[(engine_id, ghosts)] for a stem, optionally limited to the given engines."""
+        out = []
+        for key, g in self.ghosts.items():
+            r, _, eng = key.partition(":")
+            if r == role and (engines is None or eng in engines):
+                out.append((eng, g))
+        return out
+
+    def engines_for(self, role: str | None = None) -> list[str]:
+        ids = []
+        for key in self.ghosts:
+            r, _, eng = key.partition(":")
+            if (role is None or r == role) and eng not in ids:
+                ids.append(eng)
+        return ids
+
+    def heat_for(self, role: str, engine: str | None) -> PitchImage | None:
+        if engine and f"heat:{role}:{engine}" in self.images:
+            return self.images[f"heat:{role}:{engine}"]
+        for key, img in self.images.items():
+            if key.startswith(f"heat:{role}:"):
+                return img
+        return None
 
     def save(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)

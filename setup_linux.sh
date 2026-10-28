@@ -23,9 +23,9 @@ case "$AI" in
   n|N|--no-ai) ;;
   *)
     if command -v nvidia-smi >/dev/null 2>&1; then
-      venv/bin/pip install -U torch --index-url https://download.pytorch.org/whl/cu128
+      venv/bin/pip install -U torch torchaudio --index-url https://download.pytorch.org/whl/cu128
     else
-      venv/bin/pip install -U torch --index-url https://download.pytorch.org/whl/cpu
+      venv/bin/pip install -U torch torchaudio --index-url https://download.pytorch.org/whl/cpu
     fi
     venv/bin/pip install -U -r requirements-ai.txt
     venv/bin/pip install --no-deps basic-pitch

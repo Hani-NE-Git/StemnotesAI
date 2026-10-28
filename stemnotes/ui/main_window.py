@@ -229,6 +229,7 @@ class MainWindow(QMainWindow):
             self.bpm.blockSignals(True); self.bpm.setValue(project.bpm); self.bpm.blockSignals(False)
             self.offset.blockSignals(True); self.offset.setValue(project.offset); self.offset.blockSignals(False)
             self.layers.set_sources(project.analysis.sources or [t.role for t in project.audio_tracks() if t.role])
+            self.layers.set_engines(project.analysis.engines_for())
             self.setWindowTitle(f"StemNotes {__version__} — {project.name}")
             if self.tracks.active_id:
                 self._track_selected(self.tracks.active_id)
@@ -325,9 +326,10 @@ class MainWindow(QMainWindow):
             return
         self.engine.stop()
         first = not (self.project.dir / "stems").exists()
-        dlg = AnalysisDialog(self.project, self, first_time=first)
+        dlg = AnalysisDialog(self.project, self, first_time=first, settings=self.settings)
         dlg.finished_ok.connect(self._analysis_done)
         dlg.exec()
+        save_settings(self.settings)
 
     def _analysis_done(self) -> None:
         self.project.analysis.load()

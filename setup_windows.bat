@@ -52,7 +52,7 @@ if "%AI%"=="" (
 if /i "%AI%"=="n" goto :done
 if /i "%AI%"=="--no-ai" goto :done
 echo [5/5] Installing PyTorch (CUDA 12.8 build, works with RTX 50xx / Blackwell) ...
-python\python.exe -m pip install --no-warn-script-location -U torch --index-url https://download.pytorch.org/whl/cu128 || goto :fail
+python\python.exe -m pip install --no-warn-script-location -U torch torchaudio --index-url https://download.pytorch.org/whl/cu128 || goto :fail
 echo       Installing Demucs, Basic Pitch and friends ...
 python\python.exe -m pip install --no-warn-script-location -U -r requirements-ai.txt || goto :fail
 python\python.exe -m pip install --no-warn-script-location --no-deps basic-pitch || goto :fail

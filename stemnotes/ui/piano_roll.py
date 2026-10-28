@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QWidget
 from ..gm import GM_DRUMS, is_black, note_name
 from ..project import Note, Project, Track, PITCH_HIGH, PITCH_LOW, N_PITCHES
 from .colormaps import HEAT_LUT, SPECTRO_LUT, ImageCache
+from ..analysis.engines import engine_color
 
 KEY_W_NOTES = 84
 KEY_W_DRUMS = 136
@@ -39,6 +40,8 @@ class LayerSettings:
     source: str = "auto"          # "auto" = follow the active track's ghost source, otherwise a role
     ghost_min_conf: float = 0.2
     ghost_labels: bool = True
+    ghost_engines: set[str] | None = None   # None = all engines; otherwise only these engine ids
+    heat_engine: str | None = None          # which engine's probability map to draw (None = first available)
 
 
 class PeakCache:
@@ -358,7 +361,7 @@ class PianoRoll(QWidget):
         for key, L, lut in (("spec", self.layers.spectrogram, SPECTRO_LUT), ("heat", self.layers.heatmap, HEAT_LUT)):
             if not L.on:
                 continue
-            img = an.images.get(f"{key}:{role}")
+            img = an.images.get(f"spec:{role}") if key == "spec" else an.heat_for(role or "", self.layers.heat_engine)
             if img is None:
                 continue
             q = self.images.get(img, lut)
@@ -427,31 +430,40 @@ class PianoRoll(QWidget):
         if not L.on:
             return
         role = self.active_source()
-        ghosts = self.project.analysis.ghosts.get(role or "", [])
-        if not ghosts:
+        groups = self.project.analysis.ghosts_for(role or "", self.layers.ghost_engines)
+        if not groups:
             return
         t_a, t_b = self.t0, self.t0 + grid.width() / self.pps
         lo, hi = self.visible_pitch_range()
         font = QFont(p.font())
         font.setPixelSize(max(8, min(11, self.key_h - 4)))
         p.setFont(font)
-        for g in ghosts:
-            if g.end < t_a or g.start > t_b or g.conf < self.layers.ghost_min_conf or not (lo <= g.pitch <= hi):
-                continue
-            x1, x2 = self.x_of(g.start), self.x_of(g.end)
-            w = max(3.0, x2 - x1)
-            y = self.y_of_pitch_top(g.pitch)
-            fill = QColor(255, 200, 60)
-            fill.setAlphaF(min(1.0, (0.12 + 0.55 * g.conf) * L.alpha))
-            border = QColor(255, 220, 120)
-            border.setAlphaF(min(1.0, (0.3 + 0.6 * g.conf) * L.alpha))
-            p.setPen(QPen(border, 1, Qt.PenStyle.DashLine))
-            p.setBrush(fill)
-            r = QRectF(x1, y + 2, w, max(2.0, self.key_h - 4))
-            p.drawRect(r)
-            if self.layers.ghost_labels and w > 26 and self.key_h >= 11:
-                p.setPen(QColor(255, 240, 200, int(230 * L.alpha)))
-                p.drawText(r.adjusted(2, 0, -2, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"{int(g.conf * 100)}%")
+        multi = len(groups) > 1
+        for gi, (eng, ghosts) in enumerate(groups):
+            cr, cg, cb = engine_color(eng)
+            # with several engines, stack their bars inside the row so they stay distinguishable
+            inner_h = max(2.0, self.key_h - 4)
+            bar_h = inner_h / len(groups) if multi else inner_h
+            y_off = 2 + gi * bar_h
+            for g in ghosts:
+                no_conf = g.conf < 0            # decision-only engines (MuScriptor): no percentage
+                if g.end < t_a or g.start > t_b or (not no_conf and g.conf < self.layers.ghost_min_conf) or not (lo <= g.pitch <= hi):
+                    continue
+                x1, x2 = self.x_of(g.start), self.x_of(g.end)
+                w = max(3.0, x2 - x1)
+                y = self.y_of_pitch_top(g.pitch)
+                conf = 0.75 if no_conf else g.conf
+                fill = QColor(cr, cg, cb)
+                fill.setAlphaF(min(1.0, (0.12 + 0.55 * conf) * L.alpha))
+                border = QColor(min(255, cr + 30), min(255, cg + 30), min(255, cb + 30))
+                border.setAlphaF(min(1.0, (0.3 + 0.6 * conf) * L.alpha))
+                p.setPen(QPen(border, 1, Qt.PenStyle.DashLine))
+                p.setBrush(fill)
+                r = QRectF(x1, y + y_off, w, max(1.5, bar_h - (1 if multi else 0)))
+                p.drawRect(r)
+                if self.layers.ghost_labels and w > 26 and bar_h >= 9 and not no_conf:
+                    p.setPen(QColor(255, 255, 255, int(220 * L.alpha)))
+                    p.drawText(r.adjusted(2, 0, -2, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"{int(g.conf * 100)}%")
 
     def _paint_other_notes(self, p: QPainter, grid: QRect) -> None:
         L = self.layers.others

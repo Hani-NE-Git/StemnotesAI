@@ -135,13 +135,14 @@ class AnalysisDialog(QDialog):
     """Runs the analysis pipeline in a background thread with progress."""
     finished_ok = Signal()
 
-    def __init__(self, project: Project, parent=None, first_time: bool = True):
+    def __init__(self, project: Project, parent=None, first_time: bool = True, settings: dict | None = None):
         super().__init__(parent)
         from ..analysis.pipeline import AnalysisOptions
         self.project = project
+        self.settings = settings if settings is not None else {}
         self.job = None
         self.setWindowTitle("ИИ-анализ песни")
-        self.resize(460, 300)
+        self.resize(640, 560)
         lay = QVBoxLayout(self)
         f = QFormLayout()
         self.cb_tempo = QCheckBox("Определить темп (BPM) и сетку")
@@ -154,6 +155,30 @@ class AnalysisDialog(QDialog):
         self.cb_notes.setChecked(True)
         for cb in (self.cb_tempo, self.cb_sep, self.cb_spec, self.cb_notes):
             f.addRow(cb)
+        from ..analysis.engines import ENGINES
+        self.engine_checks: dict[str, QCheckBox] = {}
+        saved = (settings or {}).get("engines")
+        for e in ENGINES:
+            cb = QCheckBox(f"    {e.name} — {', '.join(e.roles)}")
+            cb.setToolTip(e.description)
+            if not e.available():
+                cb.setEnabled(False)
+                cb.setText(cb.text() + "  (не установлен)")
+                cb.setChecked(False)
+            else:
+                cb.setChecked(e.default_on if saved is None else e.id in saved)
+            self.engine_checks[e.id] = cb
+            f.addRow(cb)
+        self.musc_model = QComboBox()
+        for sz, lbl in (("small", "small — 100M, можно на CPU"), ("medium", "medium — 300M, по умолчанию"), ("large", "large — 1.4B, лучшее качество, нужна GPU")):
+            self.musc_model.addItem(lbl, sz)
+        self.musc_model.setCurrentIndex(max(0, self.musc_model.findData(self.settings.get("muscriptor_model", "medium"))))
+        f.addRow("MuScriptor модель:", self.musc_model)
+        self.hf_token = QLineEdit(self.settings.get("hf_token", ""))
+        self.hf_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.hf_token.setPlaceholderText("hf_… (read-токен; сначала принять лицензию на huggingface.co/MuScriptor)")
+        self.hf_token.setToolTip("Нужен только для MuScriptor: модель закрытая (gated), скачивается с Hugging Face после принятия лицензии.")
+        f.addRow("HF token:", self.hf_token)
         self.model = QComboBox()
         self.model.addItem("htdemucs_6s — ударные, бас, гитара, пианино, вокал, остальное", "htdemucs_6s")
         self.model.addItem("htdemucs_ft — 4 стема, лучшее качество (в 4 раза дольше)", "htdemucs_ft")
@@ -211,9 +236,18 @@ class AnalysisDialog(QDialog):
 
     def _start(self) -> None:
         from ..analysis.pipeline import AnalysisJob
+        engines = [eid for eid, cb in self.engine_checks.items() if cb.isChecked()]
+        self.settings["engines"] = engines
+        self.settings["muscriptor_model"] = self.musc_model.currentData()
+        self.settings["hf_token"] = self.hf_token.text().strip()
+        try:
+            from ..ui.main_window import save_settings
+            save_settings(self.settings)
+        except Exception:
+            pass
         opts = self._opts_cls(tempo=self.cb_tempo.isChecked(), separate=self.cb_sep.isChecked(),
                               spectrograms=self.cb_spec.isChecked(), transcribe=self.cb_notes.isChecked(),
-                              model=self.model.currentData())
+                              model=self.model.currentData(), engines=engines)
         self.start_btn.setEnabled(False)
 
         def progress(frac, msg):
