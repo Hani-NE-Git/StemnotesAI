@@ -194,20 +194,39 @@ def _settings() -> dict:
 
 
 _musc_cache: dict = {}
+_musc_error: str | None = None
 
 
 def _muscriptor_model():
+    """Load (once) the MuScriptor model; a failed load is remembered so every stem does not retry the download."""
+    global _musc_error
     import os
     st = _settings()
-    token = st.get("hf_token")
+    token = (st.get("hf_token") or "").strip()
     if token:
-        os.environ["HF_TOKEN"] = token
+        for var in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
+            os.environ[var] = token
     size = st.get("muscriptor_model") or ("large" if _device() == "cuda" else "medium")
-    key = (size, _device())
-    if key not in _musc_cache:
+    key = (size, _device(), token[-6:])
+    if key in _musc_cache:
+        return _musc_cache[key]
+    if _musc_error is not None and _musc_error[0] == key:
+        raise RuntimeError(_musc_error[1])
+    try:
         from muscriptor import TranscriptionModel
         _musc_cache.clear()
         _musc_cache[key] = TranscriptionModel.load_model(size, device=_device())
+    except Exception as e:
+        msg = str(e).strip()
+        if not token:
+            msg = ("HF-токен не задан. Примите лицензию на странице модели и вставьте read-токен в поле «HF token» "
+                   "окна анализа.\n" + msg)
+        elif "403" in msg or "gated" in msg.lower() or "restricted" in msg.lower():
+            msg = (f"Hugging Face отказал в доступе к MuScriptor/muscriptor-{size}. Проверьте, что лицензия принята "
+                   f"именно на странице https://huggingface.co/MuScriptor/muscriptor-{size} и токен действителен.\n" + msg)
+        _musc_error = (key, msg)
+        raise RuntimeError(msg) from e
+    _musc_error = None
     return _musc_cache[key]
 
 

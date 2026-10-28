@@ -11,9 +11,16 @@ from ..project import GhostNote, PitchImage, PITCH_LOW, N_PITCHES
 
 def transcribe_pitched(path: Path, min_conf: float = 0.15) -> tuple[list[GhostNote], PitchImage]:
     """Returns (ghost notes, note-activation heatmap). Low thresholds on purpose: we want candidates, the user decides."""
-    from basic_pitch import ICASSP_2022_MODEL_PATH
-    from basic_pitch.inference import predict, Model
-    from basic_pitch.note_creation import model_frames_to_time
+    import logging
+    root = logging.getLogger()
+    prev = root.level
+    root.setLevel(logging.ERROR)          # basic_pitch warns about CoreML/TFLite/TensorFlow backends we do not use
+    try:
+        from basic_pitch import ICASSP_2022_MODEL_PATH
+        from basic_pitch.inference import predict, Model
+        from basic_pitch.note_creation import model_frames_to_time
+    finally:
+        root.setLevel(prev)
 
     model = Model(ICASSP_2022_MODEL_PATH)
     model_output, _midi, note_events = predict(

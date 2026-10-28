@@ -229,7 +229,8 @@ class AnalysisDialog(QDialog):
             if err is None:
                 warns = list(getattr(self.project.analysis, "warnings", []))
                 if warns:
-                    QMessageBox.warning(self, "Анализ завершён с замечаниями", "Часть движков не отработала:\n\n" + "\n\n".join(warns))
+                    text = "\n\n".join(w if len(w) < 900 else w[:900] + "…" for w in dict.fromkeys(warns))
+                    QMessageBox.warning(self, "Анализ завершён с замечаниями", "Часть движков не отработала:\n\n" + text)
                 self.finished_ok.emit()
                 self.accept()
             else:
