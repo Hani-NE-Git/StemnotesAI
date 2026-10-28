@@ -24,7 +24,7 @@ from typing import Callable
 
 from . import paths
 
-DEFAULT_REPO = "Hani-NE-Git/PyTest"
+DEFAULT_REPO = "Hani-NE-Git/StemnotesAI"
 DEFAULT_BRANCH = "main"
 # Top-level entries that are user data / downloaded content and must survive an update.
 PROTECTED = {"python", "venv", "models", "cache", "soundfonts", "projects", "vst3", "settings.json", ".git"}
