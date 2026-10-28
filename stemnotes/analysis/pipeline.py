@@ -183,7 +183,10 @@ def run_analysis(project: Project, opt: AnalysisOptions, progress: Callable[[flo
             result = run_engine(eng, song, sources["mix"], features.ANALYSIS_SR, "mix", an.warnings)
             if isinstance(result, tuple):
                 result = {}
+            from .engines import stem_energy_confidence
             for role, (ghosts, heat) in result.items():
+                if role != "mix" and role in sources and role in stems:
+                    stem_energy_confidence(ghosts, sources[role], features.ANALYSIS_SR)
                 an.ghosts[f"{role}:{eng.id}"] = ghosts
                 if heat is not None:
                     an.images[f"heat:{role}:{eng.id}"] = heat

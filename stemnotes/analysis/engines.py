@@ -264,6 +264,28 @@ def run_muscriptor_mix(path: Path, mono: np.ndarray, sr: int, role: str) -> dict
     return {r: (g, None) for r, g in out.items()}
 
 
+def stem_energy_confidence(ghosts: list[GhostNote], stem_mono: np.ndarray, sr: int) -> None:
+    """For notes routed to a stem by instrument label, measure how loud that stem is under the note.
+    conf 1.0 = stem at its normal level, ~0.05 = stem silent (the note probably belongs to another instrument)."""
+    if not ghosts or len(stem_mono) == 0:
+        return
+    x = stem_mono.astype(np.float32)
+    win = max(1, int(0.02 * sr))
+    n = len(x) // win
+    if n == 0:
+        return
+    rms = np.sqrt((x[:n * win].reshape(n, win) ** 2).mean(axis=1) + 1e-12)
+    ref = float(np.percentile(rms, 95)) + 1e-9
+    for g in ghosts:
+        a = int(g.start / 0.02)
+        b = max(a + 1, int(min(g.end, g.start + 0.5) / 0.02))
+        seg = rms[a:b]
+        if len(seg) == 0:
+            continue
+        db = 20 * np.log10(float(seg.max()) / ref + 1e-9)
+        g.conf = float(np.clip((db + 40.0) / 30.0, 0.05, 1.0))   # -10 dB → 1.0, -40 dB → ~0.05
+
+
 def run_muscriptor_stem(path: Path, mono: np.ndarray, sr: int, role: str):
     """Transcribe one separated stem, constrained to that stem's instrument groups."""
     model = _muscriptor_model()
@@ -281,11 +303,13 @@ def run_drums_heuristic(path: Path, mono: np.ndarray, sr: int, role: str):
 
 ENGINES: list[Engine] = [
     Engine("muscriptor", "MuScriptor (вся песня)", "pitched", ["mix", "bass", "drums", "guitar", "piano", "vocals", "other"], (255, 110, 220),
-           "Основной движок. Kyutai/Mirelo: один проход по оригиналу, ноты раскладываются по инструментам, включая ударные. "
+           "Kyutai/Mirelo: один проход по оригиналу, ноты раскладываются по инструментам, как их опознала модель. "
+           "Процент = насколько стем звучит под нотой (тихий стем → нота, скорее всего, чужая). "
            "Нужен HF-токен и принятая лицензия модели (некоммерческая).", ["muscriptor", "torch"], run_muscriptor_mix, multi_role=True),
     Engine("muscriptor_stem", "MuScriptor (по стемам)", "pitched", ["bass", "drums", "guitar", "piano", "vocals"], (200, 120, 255),
-           "MuScriptor отдельно на каждом стеме с ограничением по инструменту. Точнее на плотных миксах, дольше.",
-           ["muscriptor", "torch"], run_muscriptor_stem, default_on=False),
+           "MuScriptor отдельно на каждом стеме Demucs, модели запрещено выдавать чужие инструменты. "
+           "Надёжнее для баса и пианино, дольше.",
+           ["muscriptor", "torch"], run_muscriptor_stem, default_on=True),
     Engine("basic_pitch", "Basic Pitch (Spotify)", "pitched", list(PITCHED_ROLES), (255, 200, 60),
            "Полифония, любой инструмент. Даёт несколько кандидатов и карту вероятностей.", ["basic_pitch", "onnxruntime"], run_basic_pitch),
     Engine("crepe", "CREPE (монофония)", "pitched", ["bass", "vocals"], (120, 220, 255),
