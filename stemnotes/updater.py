@@ -213,9 +213,14 @@ def update_via_git(force: bool, progress: Progress) -> dict:
         raise RuntimeError("git fetch не удался:\n" + (r.stderr or r.stdout).strip())
     head = _run_git("rev-parse", "HEAD").stdout.strip()
     remote = _run_git("rev-parse", "FETCH_HEAD").stdout.strip()
+    remote_version = _run_git("show", "FETCH_HEAD:VERSION").stdout.strip() or "0.0.0"
     if head == remote and not force:
         progress(1.0, f"Установлена актуальная версия {local} (git {head[:7]})")
         return {"updated": False, "local": local, "remote": local, "changed": []}
+    if not force and not is_newer(remote_version, local):
+        # never downgrade: the remote is the same or older than what is installed
+        progress(1.0, f"В репозитории версия {remote_version}, установлена {local}: обновлять нечего")
+        return {"updated": False, "local": local, "remote": remote_version, "changed": []}
     progress(0.4, "Применение изменений (git)…")
     changed = [l for l in _run_git("diff", "--name-status", "HEAD", "FETCH_HEAD").stdout.splitlines() if l.strip()]
     if force:
@@ -223,7 +228,7 @@ def update_via_git(force: bool, progress: Progress) -> dict:
     else:
         r = _run_git("merge", "--ff-only", "FETCH_HEAD")
         if r.returncode != 0:
-            # local edits in the way: keep them aside and take the remote version
+            # local commits/edits diverged from the repository: keep them aside, then take the repository version
             _run_git("stash", "push", "-u", "-m", "stemnotes-updater")
             r = _run_git("reset", "--hard", "FETCH_HEAD")
     if r.returncode != 0:
