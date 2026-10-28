@@ -1,0 +1,16 @@
+# AI module: stem separation + transcription. torch is installed separately (CUDA build on Windows).
+demucs>=4.1
+onnxruntime>=1.17
+librosa>=0.10
+mir-eval>=0.6
+pretty-midi>=0.2.9
+resampy>=0.2.2,<0.4.3
+scikit-learn
+scipy
+typing-extensions
+# basic-pitch is installed with --no-deps (otherwise it pulls TensorFlow); it uses the ONNX model.
+# extra ghost-note engines (torchaudio is installed together with torch from the same index)
+torchcrepe>=0.0.24
+piano_transcription_inference>=0.0.6
+audioread
+muscriptor>=0.4.0
