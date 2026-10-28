@@ -244,6 +244,16 @@ class MainWindow(QMainWindow):
         self._sync_bars()
         self.roll.invalidate()
 
+    def _busy(self, text: str):
+        from PySide6.QtWidgets import QProgressDialog
+        dlg = QProgressDialog(text, "", 0, 0, self)
+        dlg.setWindowTitle("StemNotes")
+        dlg.setCancelButton(None)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(200)
+        dlg.show()
+        return dlg
+
     def _load_into_audio(self, project: Project) -> None:
         """Send the project to the audio process in a background thread; the window stays responsive."""
         import threading
@@ -480,6 +490,11 @@ class MainWindow(QMainWindow):
                 t.instrument["state"] = payload.get("state")
                 self.project.dirty = True
                 self.statusBar().showMessage("Окно плагина закрыто, настройки сохранены в проект", 4000)
+        elif name == "callback":
+            try:
+                payload["fn"](payload.get("result"), payload.get("error"))
+            except Exception:
+                log.exception("callback failed")
         elif name == "server_gone":
             QMessageBox.critical(self, "Звук", "Аудиопроцесс завершился. Перезапустите программу. Подробности в logs\\stemnotes.log")
 
@@ -534,37 +549,44 @@ class MainWindow(QMainWindow):
         if dlg.exec() != InstrumentDialog.DialogCode.Accepted or not dlg.result_instrument:
             return
         inst = dlg.result_instrument
-        try:
-            if inst["type"] == "vst3":
-                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-                try:
-                    names = self.engine.vst_names(inst["path"])
-                finally:
-                    QApplication.restoreOverrideCursor()
-                plugin_name = None
-                if len(names) > 1:
-                    plugin_name, ok = QInputDialog.getItem(self, "VST3", "В файле несколько плагинов, выберите:", names, 0, False)
-                    if not ok:
-                        return
-                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-                try:
-                    r = self.engine.replace_vst(t, inst["path"], plugin_name)
-                finally:
-                    QApplication.restoreOverrideCursor()
-                if not r.get("ok"):
-                    raise RuntimeError(r.get("error"))
-                self.statusBar().showMessage(f"VST3 загружен: {r.get('name')}. Кнопка «Окно VST» открывает его интерфейс, «Тест VST» проверяет звук.", 8000)
-            else:
-                t.instrument = inst
+        if inst["type"] != "vst3":
+            t.instrument = inst
             self.engine.sync()
-        except Exception as e:
-            log.exception("instrument change failed")
-            QMessageBox.critical(self, "Инструмент", f"Не удалось загрузить:\n{e}")
+            self.project.dirty = True
+            self.tracks.refresh()
+            self._track_selected(tid)
+            self.roll.invalidate()
             return
-        self.project.dirty = True
-        self.tracks.refresh()
-        self._track_selected(tid)
-        self.roll.invalidate()
+        busy = self._busy(f"Загрузка VST3: {Path(inst['path']).name}…")
+
+        def loaded(r, err):
+            busy.close()
+            if err or not (r or {}).get("ok"):
+                msg = err or (r or {}).get("error")
+                log.error("VST3 load failed: %s", msg)
+                QMessageBox.critical(self, "VST3", f"Не удалось загрузить плагин:\n{msg}\n\nПодробности в logs\\stemnotes.log")
+                return
+            t.instrument = r["instrument"]
+            self.engine.vst_tracks[t.id] = r["name"]
+            self.project.dirty = True
+            self.tracks.refresh()
+            self._track_selected(tid)
+            self.statusBar().showMessage(f"VST3 загружен: {r.get('name')}. «Тест VST» проверяет звук, «Окно VST» открывает интерфейс.", 8000)
+
+        def names_done(names, err):
+            if err:
+                busy.close()
+                QMessageBox.critical(self, "VST3", f"Не удалось прочитать плагин:\n{err}")
+                return
+            plugin_name = None
+            if names and len(names) > 1:
+                busy.close()
+                plugin_name, ok = QInputDialog.getItem(self, "VST3", "В файле несколько плагинов, выберите:", names, 0, False)
+                if not ok:
+                    return
+                busy.show()
+            self.engine.call_async("replace_vst", loaded, track_id=t.id, path=inst["path"], plugin_name=plugin_name)
+        self.engine.call_async("vst_names", names_done, path=inst["path"])
 
     def open_vst_editor(self) -> None:
         tid = self.tracks.active_id
@@ -580,19 +602,18 @@ class MainWindow(QMainWindow):
         if not tid or not self.engine.has_vst(tid):
             self.statusBar().showMessage("У активной дорожки нет VST3-инструмента", 4000)
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            r = self.engine.test_vst(tid)
-        except Exception as e:
-            r = {"ok": False, "error": str(e)}
-        finally:
-            QApplication.restoreOverrideCursor()
-        if r.get("ok"):
-            verdict = "плагин выдаёт звук" if r["peak"] > 1e-4 else "ТИШИНА: откройте окно плагина и выберите пресет/инструмент"
-            QMessageBox.information(self, "Тест VST3", f"{r.get('name')}\nСэмплов: {r['samples']}, пик: {r['peak']:.3f}, "
-                                    f"время рендера: {r['seconds']:.2f} с, параметров: {r.get('params')}\n\n{verdict}")
-        else:
-            QMessageBox.warning(self, "Тест VST3", f"Ошибка: {r.get('error')}\n\nПодробности в logs\\stemnotes.log")
+        busy = self._busy("Тест VST3: рендер одной ноты…")
+
+        def done(r, err):
+            busy.close()
+            r = r or {"ok": False, "error": err}
+            if r.get("ok"):
+                verdict = "плагин выдаёт звук" if r["peak"] > 1e-4 else "ТИШИНА: плагин не отдал звук"
+                QMessageBox.information(self, "Тест VST3", f"{r.get('name')}\nСэмплов: {r['samples']}, пик: {r['peak']:.3f}, "
+                                        f"время рендера: {r['seconds']:.2f} с, параметров: {r.get('params')}\n\n{verdict}")
+            else:
+                QMessageBox.warning(self, "Тест VST3", f"Ошибка: {r.get('error')}\n\nПодробности в logs\\stemnotes.log")
+        self.engine.call_async("test_vst", done, track_id=tid)
 
     def _add_midi_track(self) -> None:
         if self.project is None:

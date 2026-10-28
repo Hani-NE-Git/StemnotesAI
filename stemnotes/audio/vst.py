@@ -73,7 +73,7 @@ class VSTInstrument:
         msgs.sort(key=lambda m: m[1])
         duration = end + tail
         with self.lock:
-            out = self.plugin(msgs, duration, float(sample_rate), num_channels=2, reset=reset)
+            out = self.plugin(msgs, duration, float(sample_rate), num_channels=2, buffer_size=512, reset=reset)
         out = np.asarray(out, dtype=np.float32)
         if out.ndim == 1:
             out = out[None, :]

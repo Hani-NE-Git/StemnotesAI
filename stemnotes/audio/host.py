@@ -127,6 +127,17 @@ class AudioHost:
             raise RuntimeError(p.get("error"))
         return p.get("result")
 
+    def call_async(self, op: str, done, **kw) -> None:
+        """Run a (possibly slow) call in a thread; `done(result, error)` is delivered as a 'callback' event
+        so the UI picks it up in its timer without blocking."""
+        def work():
+            try:
+                r = self.call(op, timeout=None, **kw)
+                self._events.put(("callback", {"fn": done, "result": r, "error": None}))
+            except Exception as e:
+                self._events.put(("callback", {"fn": done, "result": None, "error": str(e)}))
+        threading.Thread(target=work, daemon=True).start()
+
     def poll_events(self) -> list[tuple[str, dict]]:
         out = []
         while True:
@@ -170,14 +181,16 @@ class AudioHost:
         self.vst_tracks = r.get("vst_tracks", {})
 
     def sync(self) -> None:
-        """Push the current project state (notes, mix, instruments, tempo) to the audio process."""
+        """Push the current project state (notes, mix, instruments, tempo) to the audio process, without waiting."""
         if self.project is None:
             return
-        try:
-            r = self.call("sync", directory=str(self.project.dir), data=self.project.to_json(), timeout=600)
-            self.vst_tracks = r.get("vst_tracks", {})
-        except Exception as e:
-            self._events.put(("error", {"message": str(e)}))
+
+        def done(r, err):
+            if err:
+                self._events.put(("error", {"message": err}))
+            elif r:
+                self.vst_tracks = r.get("vst_tracks", {})
+        self.call_async("sync", done, directory=str(self.project.dir), data=self.project.to_json())
 
     # transport
     @property

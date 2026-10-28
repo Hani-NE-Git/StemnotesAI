@@ -178,14 +178,21 @@ class AudioServer:
         return ev
 
 
+PLUGIN_OPS = {"replace_vst", "show_editor", "test_vst", "vst_names", "set_project", "sync", "load_soundfont"}
+
+
 def run_server(conn, shared) -> None:
-    """Child-process entry point: serve commands from the pipe until 'quit'."""
+    """Child-process entry point. Commands that touch plugins run on the main thread (Pedalboard requires it);
+    transport, preview and queries run on the dispatcher thread, so the UI never waits behind a plugin."""
+    import queue
+    import threading
     from .. import log as _log
     _log.setup()
     log.info("audio server process started")
     server = AudioServer(shared)
-    import threading
     send_lock = threading.Lock()
+    plugin_queue: queue.Queue = queue.Queue()
+    stop = threading.Event()
 
     def send(msg):
         with send_lock:
@@ -194,26 +201,49 @@ def run_server(conn, shared) -> None:
             except Exception:
                 pass
 
-    running = True
-    while running:
+    def execute(cid, cmd):
         try:
-            if conn.poll(0.05):
-                kind, cid, cmd = conn.recv()
-                try:
-                    result = server.handle(cmd)
-                    send(("reply", cid, {"ok": True, "result": result}))
-                except Exception as e:
-                    log.exception("command failed: %s", cmd.get("op"))
-                    send(("reply", cid, {"ok": False, "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()}))
-                if cmd.get("op") == "quit":
-                    running = False
-            for name, payload in server.drain_events():
-                send(("event", name, payload))
-        except (EOFError, BrokenPipeError, OSError):
-            log.info("audio server: pipe closed, exiting")
+            result = server.handle(cmd)
+            send(("reply", cid, {"ok": True, "result": result}))
+        except Exception as e:
+            log.exception("command failed: %s", cmd.get("op"))
+            send(("reply", cid, {"ok": False, "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc()}))
+
+    def dispatcher():
+        while not stop.is_set():
+            try:
+                if conn.poll(0.05):
+                    kind, cid, cmd = conn.recv()
+                    if cmd.get("op") == "quit":
+                        plugin_queue.put((cid, cmd))
+                        stop.set()
+                        break
+                    if cmd.get("op") in PLUGIN_OPS:
+                        plugin_queue.put((cid, cmd))
+                    else:
+                        execute(cid, cmd)
+                for name, payload in server.drain_events():
+                    send(("event", name, payload))
+            except (EOFError, BrokenPipeError, OSError):
+                log.info("audio server: pipe closed, exiting")
+                stop.set()
+                plugin_queue.put(None)
+                break
+            except Exception:
+                log.exception("audio server dispatcher error")
+
+    threading.Thread(target=dispatcher, daemon=True, name="dispatcher").start()
+    while not stop.is_set() or not plugin_queue.empty():
+        try:
+            item = plugin_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if item is None:
             break
-        except Exception:
-            log.exception("audio server loop error")
+        cid, cmd = item
+        execute(cid, cmd)
+        if cmd.get("op") == "quit":
+            break
     try:
         server.engine.stop_stream()
     except Exception:
