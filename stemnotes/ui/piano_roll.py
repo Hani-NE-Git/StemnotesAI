@@ -1,25 +1,34 @@
-"""Piano roll with layered background: waveform, CQT spectrogram, AI activation heatmap, ghost-note candidates,
-other tracks' notes, grid; plus note editing for the active track."""
+"""Piano roll: tiled, cached background (rows, waveform, spectrogram, AI heatmap, grid, ghost candidates, other
+tracks) plus a cheap dynamic layer (active track notes, selection, loop, playhead). Thousands of ghost notes are
+culled with numpy and drawn in batches, so panning and zooming stay smooth."""
 from __future__ import annotations
 
 import copy
+import math
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
+from PySide6.QtCore import QLineF, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import QWidget
 
+from ..analysis.engines import engine_color
+from ..audio.loader import load_peaks
 from ..gm import GM_DRUMS, is_black, note_name
+from ..log import get as _get_log
 from ..project import Note, Project, Track, PITCH_HIGH, PITCH_LOW, N_PITCHES
 from .colormaps import HEAT_LUT, SPECTRO_LUT, ImageCache
-from ..analysis.engines import engine_color
+
+log = _get_log("pianoroll")
 
 KEY_W_NOTES = 84
 KEY_W_DRUMS = 136
 RULER_H = 36
 MIN_KEY_H, MAX_KEY_H = 6, 40
 MIN_PPS, MAX_PPS = 8.0, 2000.0
+TILE = 512
+MAX_TILES = 160
 
 
 @dataclass
@@ -37,38 +46,63 @@ class LayerSettings:
     others: Layer = field(default_factory=lambda: Layer(False, 0.35))
     grid: Layer = field(default_factory=lambda: Layer(True, 1.0))
     beats: Layer = field(default_factory=lambda: Layer(True, 1.0))
-    source: str = "auto"          # "auto" = follow the active track's ghost source, otherwise a role
+    source: str = "auto"
     ghost_min_conf: float = 0.2
     ghost_labels: bool = True
-    ghost_engines: set[str] | None = None   # None = all engines; otherwise only these engine ids
-    heat_engine: str | None = None          # which engine's probability map to draw (None = first available)
+    ghost_engines: set[str] | None = None
+    heat_engine: str | None = None
 
 
-class PeakCache:
-    """Min/max per chunk for fast waveform drawing."""
-    CHUNK = 64
+class PeakStore:
+    """Waveform peaks per audio file (min/max per 64 samples), loaded once, audio itself is not kept."""
 
     def __init__(self):
-        self._cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._peaks: dict[str, tuple[np.ndarray, np.ndarray, int]] = {}
+        self._failed: set[str] = set()
 
-    def get(self, audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        key = id(audio)
-        if key in self._cache:
-            return self._cache[key]
-        mono = audio.mean(axis=1) if audio.ndim == 2 else audio
-        n = (len(mono) // self.CHUNK) * self.CHUNK
-        if n == 0:
-            r = (np.zeros(1, np.float32), np.zeros(1, np.float32))
+    def get(self, path) -> tuple[np.ndarray, np.ndarray, int] | None:
+        key = str(path)
+        if key in self._peaks:
+            return self._peaks[key]
+        if key in self._failed:
+            return None
+        try:
+            self._peaks[key] = load_peaks(path, 22050, 64)
+        except Exception:
+            log.exception("peaks failed for %s", path)
+            self._failed.add(key)
+            return None
+        return self._peaks[key]
+
+    def clear(self) -> None:
+        self._peaks.clear()
+        self._failed.clear()
+
+
+class GhostArrays:
+    """numpy view of ghost note lists for fast culling. Cached by the identity of the list object."""
+
+    def __init__(self):
+        self._cache: dict[int, tuple] = {}
+
+    def get(self, ghosts: list):
+        key = id(ghosts)
+        hit = self._cache.get(key)
+        if hit is not None and hit[0] is ghosts:
+            return hit[1]
+        if ghosts:
+            arr = np.array([(g.start, g.end, g.pitch, g.conf) for g in ghosts], dtype=np.float64)
         else:
-            m = mono[:n].reshape(-1, self.CHUNK)
-            r = (m.min(axis=1), m.max(axis=1))
-        self._cache[key] = r
-        return r
+            arr = np.zeros((0, 4), dtype=np.float64)
+        self._cache[key] = (ghosts, arr)
+        if len(self._cache) > 64:
+            self._cache.pop(next(iter(self._cache)))
+        return arr
 
 
 class PianoRoll(QWidget):
-    notes_changed = Signal(str)        # track id
-    seek_requested = Signal(float)     # seconds
+    notes_changed = Signal(str)
+    seek_requested = Signal(float)
     loop_changed = Signal(bool, float, float)
     status = Signal(str)
     view_changed = Signal()
@@ -78,26 +112,27 @@ class PianoRoll(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.project: Project | None = None
-        self.engine = None
+        self.host = None
         self.track: Track | None = None
         self.layers = LayerSettings()
         self.images = ImageCache()
-        self.peaks = PeakCache()
+        self.peaks = PeakStore()
+        self.ghost_arrays = GhostArrays()
 
         self.key_w = KEY_W_NOTES
-        self.pps = 120.0           # pixels per second
+        self.pps = 120.0
         self.key_h = 16
-        self.t0 = 0.0              # seconds at left edge of grid
-        self.scroll_y = (PITCH_HIGH - 72) * self.key_h   # start around C5 at top
-        self.snap = 0.25           # beats (0 = off)
-        self.default_len = 1.0     # beats
+        self.t0 = 0.0
+        self.scroll_y = (PITCH_HIGH - 72) * self.key_h
+        self.snap = 0.25
+        self.default_len = 1.0
         self.playhead = 0.0
         self.loop_on = False
         self.loop_a = 0.0
         self.loop_b = 0.0
         self.follow = True
 
-        self.selected: set[int] = set()   # indices into track.notes
+        self.selected: set[int] = set()
         self._mode: str | None = None
         self._press = QPointF()
         self._drag_orig: list[Note] = []
@@ -105,28 +140,26 @@ class PianoRoll(QWidget):
         self._create_idx: int | None = None
         self._rubber: QRectF | None = None
         self._preview_pitch: int | None = None
-        self._hover_pitch: int | None = None
         self._pan_start = (0.0, 0.0)
         self._undo: dict[str, list[list[Note]]] = {}
         self._redo: dict[str, list[list[Note]]] = {}
         self._clipboard: list[Note] = []
-        self._rev = 0
-        self._bg: QPixmap | None = None
-        self._bg_key = None
+        self._moved = False
+
+        self._gen = 0                                   # static background generation
+        self._notes_cache: tuple[int, int, np.ndarray] | None = None   # (id(notes), rev, array)
+        self._notes_rev = 0
+        self._tiles: OrderedDict[tuple, QPixmap] = OrderedDict()
         self._last_ph_x: int | None = None
 
-    def invalidate(self) -> None:
-        """Content changed: redraw the cached background on next paint."""
-        self._rev += 1
-        self.update()
-
-    # ------------------------------------------------------------------ setup
-    def set_project(self, project: Project | None, engine) -> None:
+    # ------------------------------------------------------------------ setup / invalidation
+    def set_project(self, project: Project | None, host) -> None:
         self.project = project
-        self.engine = engine
+        self.host = host
         self.track = None
         self.selected.clear()
         self.images.clear()
+        self.peaks.clear()
         self.t0 = 0.0
         self.invalidate()
 
@@ -134,6 +167,7 @@ class PianoRoll(QWidget):
         if track is not self.track:
             self.selected.clear()
         self.track = track if (track is not None and track.kind == "midi") else None
+        self._notes_rev += 1
         self.key_w = KEY_W_DRUMS if (self.track is not None and self.track.is_drums) else KEY_W_NOTES
         self.invalidate()
 
@@ -141,14 +175,20 @@ class PianoRoll(QWidget):
         self.snap = beats
         self.invalidate()
 
+    def invalidate(self) -> None:
+        """Static background changed (layers, analysis, zoom, grid, source): drop cached tiles and repaint."""
+        self._gen += 1
+        self._tiles.clear()
+        self.update()
+
     def set_playhead(self, sec: float) -> None:
         self.playhead = sec
-        if self.follow and self.engine is not None and self.engine.playing:
+        if self.follow and self.host is not None and self.host.playing:
             w = self.grid_width() / self.pps
             if sec > self.t0 + w * 0.95 or sec < self.t0:
                 self.t0 = max(0.0, sec - w * 0.1)
                 self.view_changed.emit()
-                self.invalidate()
+                self.update()
                 return
         x = int(self.x_of(sec))
         if x != self._last_ph_x:
@@ -157,7 +197,7 @@ class PianoRoll(QWidget):
 
     def set_loop(self, on: bool, a: float, b: float) -> None:
         self.loop_on, self.loop_a, self.loop_b = on, a, b
-        self.invalidate()
+        self.update()
 
     # ------------------------------------------------------------------ geometry
     def grid_width(self) -> int:
@@ -171,8 +211,8 @@ class PianoRoll(QWidget):
 
     def total_seconds(self) -> float:
         end = 60.0
-        if self.engine is not None and self.engine.sample_rate:
-            end = max(end, self.engine.end_sample / self.engine.sample_rate + 20.0)
+        if self.host is not None:
+            end = max(end, self.host.end_sec + 20.0)
         return end
 
     def x_of(self, sec: float) -> float:
@@ -195,16 +235,21 @@ class PianoRoll(QWidget):
         if self.snap <= 0:
             return beat
         q = beat / self.snap
-        return (np.floor(q) if floor else np.round(q)) * self.snap
+        return float((np.floor(q) if floor else np.round(q)) * self.snap)
 
     def clamp_scroll(self) -> None:
         self.scroll_y = max(0, min(self.total_height() - self.grid_height(), self.scroll_y))
         self.t0 = max(0.0, self.t0)
 
     def visible_pitch_range(self) -> tuple[int, int]:
-        top = self.pitch_of_y(RULER_H)
-        bottom = self.pitch_of_y(self.height())
-        return bottom, top
+        return self.pitch_of_y(self.height()), self.pitch_of_y(RULER_H)
+
+    def set_zoom(self, pps: float | None = None, key_h: int | None = None) -> None:
+        if pps is not None:
+            self.pps = max(MIN_PPS, min(MAX_PPS, pps))
+        if key_h is not None:
+            self.key_h = max(MIN_KEY_H, min(MAX_KEY_H, int(key_h)))
+        self.invalidate()
 
     # ------------------------------------------------------------------ data helpers
     def active_source(self) -> str | None:
@@ -214,12 +259,12 @@ class PianoRoll(QWidget):
             return self.track.ghost_source
         return "mix"
 
-    def source_audio(self, role: str | None) -> np.ndarray | None:
-        if self.project is None or self.engine is None or role is None:
+    def source_path(self, role: str | None):
+        if self.project is None or role is None:
             return None
         for t in self.project.audio_tracks():
             if t.role == role:
-                return self.engine.audio.get(t.id)
+                return self.project.resolve(t.path)
         return None
 
     def push_undo(self) -> None:
@@ -254,7 +299,6 @@ class PianoRoll(QWidget):
         self._commit()
 
     def import_ghosts(self, engine_ids: set[str] | None, only_loop: bool = False, snap: bool = True) -> int:
-        """Copy ghost notes (seconds) of the active source into the active track as editable notes (beats)."""
         if self.track is None or self.project is None:
             return 0
         role = self.active_source()
@@ -267,7 +311,7 @@ class PianoRoll(QWidget):
         seen: set[tuple[float, int]] = set()
         for _eng, ghosts in groups:
             for g in ghosts:
-                if g.conf >= 0 and g.conf < self.layers.ghost_min_conf:
+                if 0 <= g.conf < self.layers.ghost_min_conf:
                     continue
                 if a is not None and (g.end <= a or g.start >= b):
                     continue
@@ -290,11 +334,12 @@ class PianoRoll(QWidget):
     def _commit(self) -> None:
         if self.track is None:
             return
+        self._notes_rev += 1
         self.project.dirty = True
         self.notes_changed.emit(self.track.id)
-        self.invalidate()
+        self.update()
 
-    # ------------------------------------------------------------------ painting
+    # ------------------------------------------------------------------ painting: entry
     def paintEvent(self, event) -> None:
         p = QPainter(self)
         if self.project is None:
@@ -304,35 +349,11 @@ class PianoRoll(QWidget):
             p.end()
             return
         self.clamp_scroll()
-        key = (self._rev, round(self.t0, 5), self.scroll_y, self.pps, self.key_h, self.key_w, self.width(), self.height(),
-               id(self.track), self.loop_on, self.loop_a, self.loop_b, self._preview_pitch, self.snap,
-               self._rubber.getCoords() if self._rubber is not None else None)
-        if self._bg is None or key != self._bg_key:
-            dpr = self.devicePixelRatioF()
-            pix = QPixmap(int(self.width() * dpr), int(self.height() * dpr))
-            pix.setDevicePixelRatio(dpr)
-            bp = QPainter(pix)
-            self._paint_background(bp)
-            bp.end()
-            self._bg = pix
-            self._bg_key = key
-        p.drawPixmap(0, 0, self._bg)
-        grid = QRect(self.key_w, RULER_H, self.grid_width(), self.grid_height())
-        self._paint_playhead(p, grid)
-        p.end()
-
-    def _paint_background(self, p: QPainter) -> None:
-        p.fillRect(self.rect(), QColor("#1b1d22"))
         grid = QRect(self.key_w, RULER_H, self.grid_width(), self.grid_height())
         p.save()
         p.setClipRect(grid)
-        self._paint_rows(p, grid)
-        self._paint_waveform(p, grid)
-        self._paint_images(p, grid)
-        self._paint_grid(p, grid)
+        self._paint_tiles(p, grid)
         self._paint_loop(p, grid)
-        self._paint_ghosts(p, grid)
-        self._paint_other_notes(p, grid)
         self._paint_notes(p, grid)
         if self._rubber is not None:
             p.setPen(QPen(QColor(255, 255, 255, 160), 1, Qt.PenStyle.DashLine))
@@ -341,55 +362,102 @@ class PianoRoll(QWidget):
         p.restore()
         self._paint_keyboard(p)
         self._paint_ruler(p)
+        self._paint_playhead(p, grid)
+        p.end()
 
-    def _paint_rows(self, p: QPainter, grid: QRect) -> None:
-        lo, hi = self.visible_pitch_range()
-        for pitch in range(lo, hi + 1):
-            y = self.y_of_pitch_top(pitch)
-            if is_black(pitch):
-                p.fillRect(QRectF(grid.left(), y, grid.width(), self.key_h), QColor("#16181c"))
-            else:
-                p.fillRect(QRectF(grid.left(), y, grid.width(), self.key_h), QColor("#20232a"))
+    # ------------------------------------------------------------------ painting: tiles (absolute pixel space)
+    # abs_x = sec * pps ; abs_y = (PITCH_HIGH - pitch) * key_h   (row 0 = highest pitch)
+    def _paint_tiles(self, p: QPainter, grid: QRect) -> None:
+        ax0 = self.t0 * self.pps
+        ay0 = float(self.scroll_y)
+        tx0, tx1 = int(ax0 // TILE), int((ax0 + grid.width()) // TILE)
+        ty0, ty1 = int(ay0 // TILE), int(min(ay0 + grid.height(), self.total_height()) // TILE)
+        dpr = self.devicePixelRatioF()
+        for ty in range(ty0, ty1 + 1):
+            for tx in range(tx0, tx1 + 1):
+                key = (self._gen, tx, ty)
+                pix = self._tiles.get(key)
+                if pix is None:
+                    pix = self._render_tile(tx, ty, dpr)
+                    self._tiles[key] = pix
+                    if len(self._tiles) > MAX_TILES:
+                        self._tiles.popitem(last=False)
+                else:
+                    self._tiles.move_to_end(key)
+                x = grid.left() + tx * TILE - ax0
+                y = grid.top() + ty * TILE - ay0
+                p.drawPixmap(QPointF(x, y), pix)
+
+    def _render_tile(self, tx: int, ty: int, dpr: float) -> QPixmap:
+        pix = QPixmap(int(TILE * dpr), int(TILE * dpr))
+        pix.setDevicePixelRatio(dpr)
+        pix.fill(QColor("#1b1d22"))
+        p = QPainter(pix)
+        p.translate(-tx * TILE, -ty * TILE)
+        ax_a, ax_b = tx * TILE, (tx + 1) * TILE
+        ay_a, ay_b = ty * TILE, (ty + 1) * TILE
+        t_a, t_b = ax_a / self.pps, ax_b / self.pps
+        # pitch range covered by this tile (row = PITCH_HIGH - pitch)
+        row_a, row_b = int(ay_a // self.key_h), int(ay_b // self.key_h) + 1
+        p_hi, p_lo = PITCH_HIGH - row_a, max(PITCH_LOW, PITCH_HIGH - row_b)
+        self._tile_rows(p, ax_a, ax_b, p_lo, p_hi)
+        self._tile_waveform(p, ax_a, ax_b, ay_a, ay_b, t_a, t_b)
+        self._tile_images(p, ax_a, ax_b, ay_a, ay_b, t_a, t_b)
+        self._tile_grid(p, ax_a, ax_b, ay_a, ay_b, t_a, t_b)
+        self._tile_ghosts(p, t_a, t_b, p_lo, p_hi)
+        self._tile_other_notes(p, t_a, t_b, p_lo, p_hi)
+        p.end()
+        return pix
+
+    def _abs_y(self, pitch: int) -> float:
+        return (PITCH_HIGH - pitch) * self.key_h
+
+    def _tile_rows(self, p: QPainter, ax_a: float, ax_b: float, p_lo: int, p_hi: int) -> None:
+        w = ax_b - ax_a
+        for pitch in range(p_lo, p_hi + 1):
+            y = self._abs_y(pitch)
+            p.fillRect(QRectF(ax_a, y, w, self.key_h), QColor("#16181c") if is_black(pitch) else QColor("#20232a"))
             if pitch % 12 == 0:
-                p.fillRect(QRectF(grid.left(), y + self.key_h - 1, grid.width(), 1), QColor("#3a3f4a"))
+                p.fillRect(QRectF(ax_a, y + self.key_h - 1, w, 1), QColor("#3a3f4a"))
             elif self.key_h >= 10:
-                p.fillRect(QRectF(grid.left(), y + self.key_h - 1, grid.width(), 1), QColor("#262a31"))
+                p.fillRect(QRectF(ax_a, y + self.key_h - 1, w, 1), QColor("#262a31"))
 
-    def _paint_waveform(self, p: QPainter, grid: QRect) -> None:
+    def _tile_waveform(self, p: QPainter, ax_a, ax_b, ay_a, ay_b, t_a, t_b) -> None:
         L = self.layers.waveform
         if not L.on:
             return
-        audio = self.source_audio(self.active_source())
-        if audio is None or self.engine is None:
+        peaks = self.peaks.get(self.source_path(self.active_source()))
+        if peaks is None:
             return
-        mins, maxs = self.peaks.get(audio)
-        sr = self.engine.sample_rate
-        chunk = PeakCache.CHUNK
-        w = grid.width()
-        t_px = np.arange(w + 1) / self.pps + self.t0
-        idx = (t_px * sr / chunk).astype(np.int64)
-        idx = np.clip(idx, 0, len(mins))
+        mins, maxs, sr = peaks
+        chunk = 64
+        w = int(ax_b - ax_a)
+        t_px = np.arange(w + 1) / self.pps + t_a
+        idx = np.clip((t_px * sr / chunk).astype(np.int64), 0, len(mins))
         starts, ends = idx[:-1], idx[1:]
         valid = ends > starts
         if not valid.any():
             return
         s_valid = starts[valid]
-        mn = np.minimum.reduceat(mins, s_valid) if len(s_valid) else np.zeros(0)
-        mx = np.maximum.reduceat(maxs, s_valid) if len(s_valid) else np.zeros(0)
-        # reduceat includes until next start; approximate fine for display
-        cy = grid.top() + grid.height() / 2
-        half = grid.height() / 2 * 0.95
+        mn = np.minimum.reduceat(mins, s_valid)
+        mx = np.maximum.reduceat(maxs, s_valid)
+        total_h = self.total_height()
+        cy = total_h / 2
+        half = total_h / 2 * 0.95
+        y1 = cy - mx * half
+        y2 = np.maximum(cy - mn * half, y1 + 1)
+        # keep only the part of each line inside this tile
+        y1c, y2c = np.clip(y1, ay_a, ay_b), np.clip(y2, ay_a, ay_b)
+        keep = y2c > y1c
+        if not keep.any():
+            return
+        xs = np.nonzero(valid)[0][keep] + ax_a
         col = QColor("#8fd3ff")
         col.setAlphaF(L.alpha)
         p.setPen(QPen(col, 1))
-        xs = np.nonzero(valid)[0]
-        y1 = cy - mx * half
-        y2 = np.maximum(cy - mn * half, y1 + 1)
-        from PySide6.QtCore import QLineF
-        gl = grid.left()
-        p.drawLines([QLineF(gl + float(x), float(a), gl + float(x), float(b)) for x, a, b in zip(xs, y1, y2)])
+        p.drawLines([QLineF(float(x), float(a), float(x), float(b)) for x, a, b in zip(xs, y1c[keep], y2c[keep])])
 
-    def _paint_images(self, p: QPainter, grid: QRect) -> None:
+    def _tile_images(self, p: QPainter, ax_a, ax_b, ay_a, ay_b, t_a, t_b) -> None:
         role = self.active_source()
         an = self.project.analysis
         for key, L, lut in (("spec", self.layers.spectrogram, SPECTRO_LUT), ("heat", self.layers.heatmap, HEAT_LUT)):
@@ -398,68 +466,50 @@ class PianoRoll(QWidget):
             img = an.images.get(f"spec:{role}") if key == "spec" else an.heat_for(role or "", self.layers.heat_engine)
             if img is None:
                 continue
-            q = self.images.get(img, lut)
+            cols_per_px = 1.0 / (img.dt * self.pps)
+            level = int(max(0, min(8, math.floor(math.log2(max(1.0, cols_per_px))))))
+            q, factor = self.images.get_level(img, lut, level)
             rows, cols = img.data.shape
             rps = img.rows_per_semitone
-            # visible time range -> image columns
-            t_a = self.t0
-            t_b = self.t0 + grid.width() / self.pps
-            c_a = (t_a - img.t0) / img.dt
-            c_b = (t_b - img.t0) / img.dt
-            # pitch range -> image rows (q row 0 = highest pitch = pitch_low + rows/rps)
+            c_a = (t_a - img.t0) / img.dt / factor
+            c_b = (t_b - img.t0) / img.dt / factor
             top_pitch = img.pitch_low + rows / rps
-            pitch_top_view = PITCH_HIGH + 1 - (self.scroll_y / self.key_h)         # pitch at grid top edge (upper edge of top row)
-            pitch_bot_view = pitch_top_view - grid.height() / self.key_h
-            r_a = (top_pitch - pitch_top_view) * rps
-            r_b = (top_pitch - pitch_bot_view) * rps
-            src = QRectF(c_a, r_a, c_b - c_a, r_b - r_a)
+            pitch_top = PITCH_HIGH + 1 - ay_a / self.key_h
+            pitch_bot = PITCH_HIGH + 1 - ay_b / self.key_h
+            r_a = (top_pitch - pitch_top) * rps
+            r_b = (top_pitch - pitch_bot) * rps
             p.save()
             p.setOpacity(L.alpha)
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.pps < 400)
-            p.drawImage(QRectF(grid), q, src)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, cols_per_px > 1.0 / 4)
+            p.drawImage(QRectF(ax_a, ay_a, ax_b - ax_a, ay_b - ay_a), q, QRectF(c_a, r_a, c_b - c_a, r_b - r_a))
             p.restore()
 
-    def _paint_grid(self, p: QPainter, grid: QRect) -> None:
+    def _tile_grid(self, p: QPainter, ax_a, ax_b, ay_a, ay_b, t_a, t_b) -> None:
         if not self.layers.grid.on:
             return
         proj = self.project
         beat_px = self.pps * 60.0 / proj.bpm
-        b0 = int(np.floor(proj.sec_to_beat(self.t0))) - 1
-        b1 = int(np.ceil(proj.sec_to_beat(self.t0 + grid.width() / self.pps))) + 1
-        bar_pen = QPen(QColor("#6b7280"), 1)
-        beat_pen = QPen(QColor("#3c424d"), 1)
-        sub_pen = QPen(QColor("#2b3038"), 1)
-        if self.snap > 0 and self.snap < 1 and beat_px * self.snap >= 5:
-            steps = int(round(1 / self.snap))
-            for b in range(b0, b1):
-                for s in range(1, steps):
-                    x = self.beat_x(b + s * self.snap)
-                    p.setPen(sub_pen)
-                    p.drawLine(QPointF(x, grid.top()), QPointF(x, grid.bottom()))
+        b0 = int(math.floor(proj.sec_to_beat(t_a))) - 1
+        b1 = int(math.ceil(proj.sec_to_beat(t_b))) + 1
+        sub, beats, bars = [], [], []
+        steps = int(round(1 / self.snap)) if (0 < self.snap < 1 and beat_px * self.snap >= 5) else 0
         for b in range(b0, b1):
-            x = self.beat_x(b)
+            x = proj.beat_to_sec(b) * self.pps
             if b % proj.beats_per_bar == 0:
-                p.setPen(bar_pen)
-            else:
-                if beat_px < 4:
-                    continue
-                p.setPen(beat_pen)
-            p.drawLine(QPointF(x, grid.top()), QPointF(x, grid.bottom()))
-        if self.layers.beats.on and proj.analysis.beats:
-            pen = QPen(QColor(255, 120, 200, 110), 1, Qt.PenStyle.DotLine)
-            p.setPen(pen)
-            for bt in proj.analysis.beats:
-                if self.t0 <= bt <= self.t0 + grid.width() / self.pps:
-                    x = self.x_of(bt)
-                    p.drawLine(QPointF(x, grid.top()), QPointF(x, grid.top() + 14))
+                bars.append(x)
+            elif beat_px >= 4:
+                beats.append(x)
+            for s_ in range(1, steps):
+                sub.append(proj.beat_to_sec(b + s_ * self.snap) * self.pps)
+        for xs, color in ((sub, "#2b3038"), (beats, "#3c424d"), (bars, "#6b7280")):
+            if xs:
+                p.setPen(QPen(QColor(color), 1))
+                p.drawLines([QLineF(x, ay_a, x, ay_b) for x in xs if ax_a - 1 <= x <= ax_b + 1])
+        if self.layers.beats.on and proj.analysis.beats and ay_a <= 14:
+            p.setPen(QPen(QColor(255, 120, 200, 110), 1, Qt.PenStyle.DotLine))
+            p.drawLines([QLineF(bt * self.pps, 0, bt * self.pps, 14) for bt in proj.analysis.beats if t_a <= bt <= t_b])
 
-    def _paint_loop(self, p: QPainter, grid: QRect) -> None:
-        if not self.loop_on or self.loop_b <= self.loop_a:
-            return
-        xa, xb = self.x_of(self.loop_a), self.x_of(self.loop_b)
-        p.fillRect(QRectF(xa, grid.top(), xb - xa, grid.height()), QColor(255, 255, 255, 12))
-
-    def _paint_ghosts(self, p: QPainter, grid: QRect) -> None:
+    def _tile_ghosts(self, p: QPainter, t_a, t_b, p_lo, p_hi) -> None:
         L = self.layers.ghosts
         if not L.on:
             return
@@ -467,84 +517,127 @@ class PianoRoll(QWidget):
         groups = self.project.analysis.ghosts_for(role or "", self.layers.ghost_engines)
         if not groups:
             return
-        t_a, t_b = self.t0, self.t0 + grid.width() / self.pps
-        lo, hi = self.visible_pitch_range()
+        multi = len(groups) > 1
+        inner_h = max(2.0, self.key_h - 4)
+        bar_h = inner_h / len(groups) if multi else inner_h
         font = QFont(p.font())
         font.setPixelSize(max(8, min(11, self.key_h - 4)))
         p.setFont(font)
-        multi = len(groups) > 1
         for gi, (eng, ghosts) in enumerate(groups):
+            arr = self.ghost_arrays.get(ghosts)
+            if len(arr) == 0:
+                continue
+            start, end, pitch, conf = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+            mask = (end >= t_a) & (start <= t_b) & (pitch >= p_lo) & (pitch <= p_hi)
+            mask &= (conf < 0) | (conf >= self.layers.ghost_min_conf)
+            if not mask.any():
+                continue
+            sel = arr[mask]
             cr, cg, cb = engine_color(eng)
-            # with several engines, stack their bars inside the row so they stay distinguishable
-            inner_h = max(2.0, self.key_h - 4)
-            bar_h = inner_h / len(groups) if multi else inner_h
             y_off = 2 + gi * bar_h
-            for g in ghosts:
-                no_conf = g.conf < 0            # decision-only engines (MuScriptor): no percentage
-                if g.end < t_a or g.start > t_b or (not no_conf and g.conf < self.layers.ghost_min_conf) or not (lo <= g.pitch <= hi):
+            h = max(1.5, bar_h - (1 if multi else 0))
+            conf_v = np.where(sel[:, 3] < 0, 0.75, sel[:, 3])
+            bucket = np.clip((conf_v * 4).astype(int), 0, 3)      # 4 alpha levels -> 4 batched draw calls
+            x1 = sel[:, 0] * self.pps
+            w = np.maximum(3.0, (sel[:, 1] - sel[:, 0]) * self.pps)
+            y = (PITCH_HIGH - sel[:, 2]) * self.key_h + y_off
+            for b in range(4):
+                m = bucket == b
+                if not m.any():
                     continue
-                x1, x2 = self.x_of(g.start), self.x_of(g.end)
-                w = max(3.0, x2 - x1)
-                y = self.y_of_pitch_top(g.pitch)
-                conf = 0.75 if no_conf else g.conf
+                c = (b + 1) / 4.0
                 fill = QColor(cr, cg, cb)
-                fill.setAlphaF(min(1.0, (0.12 + 0.55 * conf) * L.alpha))
+                fill.setAlphaF(min(1.0, (0.12 + 0.55 * c) * L.alpha))
                 border = QColor(min(255, cr + 30), min(255, cg + 30), min(255, cb + 30))
-                border.setAlphaF(min(1.0, (0.3 + 0.6 * conf) * L.alpha))
-                p.setPen(QPen(border, 1, Qt.PenStyle.DashLine))
+                border.setAlphaF(min(1.0, (0.3 + 0.6 * c) * L.alpha))
+                p.setPen(QPen(border, 1, Qt.PenStyle.DashLine if self.key_h >= 9 else Qt.PenStyle.SolidLine))
                 p.setBrush(fill)
-                r = QRectF(x1, y + y_off, w, max(1.5, bar_h - (1 if multi else 0)))
-                p.drawRect(r)
-                if self.layers.ghost_labels and w > 26 and bar_h >= 9 and not no_conf:
-                    p.setPen(QColor(255, 255, 255, int(220 * L.alpha)))
-                    p.drawText(r.adjusted(2, 0, -2, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"{int(g.conf * 100)}%")
+                p.drawRects([QRectF(float(a), float(yy), float(ww), h) for a, yy, ww in zip(x1[m], y[m], w[m])])
+            if self.layers.ghost_labels and bar_h >= 9 and len(sel) <= 400:
+                p.setPen(QColor(255, 255, 255, int(220 * L.alpha)))
+                for a, yy, ww, cv, raw in zip(x1, y, w, conf_v, sel[:, 3]):
+                    if raw >= 0 and ww > 26:
+                        p.drawText(QRectF(a + 2, yy, ww - 4, h), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"{int(raw * 100)}%")
 
-    def _paint_other_notes(self, p: QPainter, grid: QRect) -> None:
+    def _tile_other_notes(self, p: QPainter, t_a, t_b, p_lo, p_hi) -> None:
         L = self.layers.others
         if not L.on:
             return
-        for t in self.project.midi_tracks():
-            if t is self.track:
+        proj = self.project
+        p.setPen(Qt.PenStyle.NoPen)
+        for t in proj.midi_tracks():
+            if t is self.track or not t.notes:
                 continue
             col = QColor(t.color)
             col.setAlphaF(L.alpha)
-            p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(col)
+            rects = []
             for n in t.notes:
-                r = self._note_rect(n)
-                if r.right() < grid.left() or r.left() > grid.right():
+                if n.pitch < p_lo or n.pitch > p_hi:
                     continue
-                p.drawRect(r.adjusted(0, 3, 0, -3))
+                s_, e_ = proj.beat_to_sec(n.start), proj.beat_to_sec(n.end)
+                if e_ < t_a or s_ > t_b:
+                    continue
+                rects.append(QRectF(s_ * self.pps, self._abs_y(n.pitch) + 4, max(3.0, (e_ - s_) * self.pps), self.key_h - 8))
+            if rects:
+                p.drawRects(rects)
 
+    # ------------------------------------------------------------------ painting: dynamic layer (widget coords)
     def _note_rect(self, n: Note) -> QRectF:
         x1 = self.beat_x(n.start)
         x2 = self.beat_x(n.end)
         y = self.y_of_pitch_top(n.pitch)
         return QRectF(x1, y + 1, max(3.0, x2 - x1), self.key_h - 2)
 
-    def _paint_notes(self, p: QPainter, grid: QRect) -> None:
-        if self.track is None:
+    def _paint_loop(self, p: QPainter, grid: QRect) -> None:
+        if not self.loop_on or self.loop_b <= self.loop_a:
             return
+        xa, xb = self.x_of(self.loop_a), self.x_of(self.loop_b)
+        p.fillRect(QRectF(xa, grid.top(), xb - xa, grid.height()), QColor(255, 255, 255, 12))
+
+    def _paint_notes(self, p: QPainter, grid: QRect) -> None:
+        if self.track is None or not self.track.notes:
+            return
+        proj = self.project
         base = QColor(self.track.color)
+        t_a, t_b = self.t0, self.t0 + grid.width() / self.pps
+        lo, hi = self.visible_pitch_range()
+        notes = self.track.notes
+        c = self._notes_cache
+        if c is not None and c[0] == id(notes) and c[1] == self._notes_rev and len(c[2]) == len(notes):
+            arr = c[2]
+        else:
+            arr = np.array([(n.start, n.length, n.pitch, n.velocity) for n in notes], dtype=np.float64)
+            self._notes_cache = (id(notes), self._notes_rev, arr)
+        s_sec = proj.beat_to_sec(arr[:, 0])
+        e_sec = proj.beat_to_sec(arr[:, 0] + arr[:, 1])
+        vis = np.nonzero((e_sec >= t_a) & (s_sec <= t_b) & (arr[:, 2] >= lo) & (arr[:, 2] <= hi))[0]
+        if len(vis) == 0:
+            return
         font = QFont(p.font())
         font.setPixelSize(max(8, min(11, self.key_h - 4)))
         p.setFont(font)
-        for i, n in enumerate(self.track.notes):
-            r = self._note_rect(n)
-            if r.right() < grid.left() or r.left() > grid.right() or r.bottom() < grid.top() or r.top() > grid.bottom():
-                continue
-            c = QColor(base)
-            c = c.lighter(70 + int(60 * n.velocity / 127))
+        # batch by velocity shade (4 levels) and selection
+        rects_by: dict[tuple[int, bool], list[QRectF]] = {}
+        for i in vis:
+            i = int(i)
+            r = self._note_rect(notes[i])
+            shade = min(3, int(arr[i, 3] / 32))
+            rects_by.setdefault((shade, i in self.selected), []).append(r)
+        for (shade, sel), rects in rects_by.items():
+            c = QColor(base).lighter(70 + 20 * shade)
             p.setBrush(c)
-            if i in self.selected:
-                p.setPen(QPen(QColor("white"), 2))
-            else:
-                p.setPen(QPen(base.darker(160), 1))
-            p.drawRoundedRect(r, 2, 2)
-            if r.width() > 24 and self.key_h >= 11:
-                p.setPen(QColor(0, 0, 0, 200))
-                label = GM_DRUMS.get(n.pitch, note_name(n.pitch)) if self.track.is_drums else note_name(n.pitch)
-                p.drawText(r.adjusted(3, 0, -2, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+            p.setPen(QPen(QColor("white"), 2) if sel else QPen(base.darker(160), 1))
+            p.drawRects(rects)
+        if self.key_h >= 11 and len(vis) <= 500:
+            p.setPen(QColor(0, 0, 0, 200))
+            drums = self.track.is_drums
+            for i in vis:
+                n = notes[int(i)]
+                r = self._note_rect(n)
+                if r.width() > 24:
+                    label = GM_DRUMS.get(n.pitch, note_name(n.pitch)) if drums else note_name(n.pitch)
+                    p.drawText(r.adjusted(3, 0, -2, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
 
     def _paint_playhead(self, p: QPainter, grid: QRect) -> None:
         x = self.x_of(self.playhead)
@@ -591,30 +684,28 @@ class PianoRoll(QWidget):
         font = QFont(p.font())
         font.setPixelSize(10)
         p.setFont(font)
-        # bars
         bar_beats = proj.beats_per_bar
         beat_px = self.pps * 60.0 / proj.bpm
         bar_px = beat_px * bar_beats
         step = 1
         while bar_px * step < 40:
             step *= 2
-        b0 = int(np.floor(proj.sec_to_beat(self.t0) / bar_beats)) - 1
-        b1 = int(np.ceil(proj.sec_to_beat(self.t0 + self.grid_width() / self.pps) / bar_beats)) + 1
+        b0 = int(math.floor(proj.sec_to_beat(self.t0) / bar_beats)) - 1
+        b1 = int(math.ceil(proj.sec_to_beat(self.t0 + self.grid_width() / self.pps) / bar_beats)) + 1
+        p.setPen(QColor("#9aa3b2"))
         for bar in range(b0, b1):
             if bar % step:
                 continue
             x = self.beat_x(bar * bar_beats)
-            p.setPen(QColor("#9aa3b2"))
             p.drawLine(QPointF(x, 0), QPointF(x, 16))
             p.drawText(QPointF(x + 3, 12), str(bar + 1))
-        # seconds
         sec_step = 1.0
         while self.pps * sec_step < 60:
             sec_step *= 2
         while self.pps * sec_step > 240 and sec_step > 0.25:
             sec_step /= 2
-        s0 = int(np.floor(self.t0 / sec_step))
-        s1 = int(np.ceil((self.t0 + self.grid_width() / self.pps) / sec_step)) + 1
+        s0 = int(math.floor(self.t0 / sec_step))
+        s1 = int(math.ceil((self.t0 + self.grid_width() / self.pps) / sec_step)) + 1
         p.setPen(QColor("#6f7a8a"))
         for k in range(s0, s1):
             t = k * sec_step
@@ -627,7 +718,6 @@ class PianoRoll(QWidget):
 
     # ------------------------------------------------------------------ hit testing
     def _note_at(self, pos: QPointF) -> tuple[int | None, bool]:
-        """Returns (index, near_right_edge)."""
         if self.track is None:
             return None, False
         for i in range(len(self.track.notes) - 1, -1, -1):
@@ -651,13 +741,12 @@ class PianoRoll(QWidget):
             elif e.button() == Qt.MouseButton.RightButton:
                 self.loop_on = False
                 self.loop_changed.emit(False, self.loop_a, self.loop_b)
-                self.invalidate()
+                self.update()
             return
         if pos.x() < self.key_w and pos.y() >= RULER_H:
             if e.button() == Qt.MouseButton.LeftButton and self.track is not None:
-                pitch = self.pitch_of_y(pos.y())
                 self._mode = "keys"
-                self._key_preview(pitch)
+                self._key_preview(self.pitch_of_y(pos.y()))
             return
         if e.button() == Qt.MouseButton.MiddleButton:
             self._mode = "pan"
@@ -690,7 +779,6 @@ class PianoRoll(QWidget):
             self._mode = "resize" if edge else "move"
             self._moved = False
             if mods & Qt.KeyboardModifier.ControlModifier and self._mode == "move":
-                # ctrl-drag = duplicate
                 new_notes = [copy.copy(n) for n in self._drag_orig]
                 base = len(self.track.notes)
                 self.track.notes.extend(new_notes)
@@ -704,7 +792,6 @@ class PianoRoll(QWidget):
             if not (mods & Qt.KeyboardModifier.ShiftModifier):
                 self.selected.clear()
             return
-        # create note
         beat = self.snap_beat(self.project.sec_to_beat(self.sec_of(pos.x())), floor=True)
         pitch = self.pitch_of_y(pos.y())
         self.push_undo()
@@ -714,7 +801,7 @@ class PianoRoll(QWidget):
         self.selected = {self._create_idx}
         self._mode = "create"
         self._key_preview(pitch)
-        self.invalidate()
+        self.update()
 
     def mouseMoveEvent(self, e: QMouseEvent) -> None:
         if self.project is None:
@@ -728,7 +815,7 @@ class PianoRoll(QWidget):
                 pitch = self.pitch_of_y(pos.y())
                 sec = self.sec_of(pos.x())
                 beat = self.project.sec_to_beat(sec)
-                bar = int(np.floor(beat / self.project.beats_per_bar)) + 1
+                bar = int(math.floor(beat / self.project.beats_per_bar)) + 1
                 bb = beat - (bar - 1) * self.project.beats_per_bar
                 name = GM_DRUMS.get(pitch, note_name(pitch)) if (self.track and self.track.is_drums) else note_name(pitch)
                 self.status.emit(f"{name} ({pitch})   такт {bar}, доля {bb + 1:.2f}   {sec:6.2f} с")
@@ -739,7 +826,7 @@ class PianoRoll(QWidget):
             if abs(pos.x() - self._press.x()) > 4:
                 self.loop_a, self.loop_b, self.loop_on = a, b, True
                 self.loop_changed.emit(True, a, b)
-            self.invalidate()
+            self.update()
             return
         if mode == "keys":
             pitch = self.pitch_of_y(pos.y())
@@ -752,17 +839,18 @@ class PianoRoll(QWidget):
             self.scroll_y = self._pan_start[1] - (pos.y() - self._press.y())
             self.clamp_scroll()
             self.view_changed.emit()
-            self.invalidate()
+            self.update()
             return
         if mode == "erase":
             self._erase_at(pos)
             return
         if mode == "rubber":
             self._rubber = QRectF(self._press, pos).normalized()
-            self.invalidate()
+            self.update()
             return
         if self.track is None:
             return
+        self._notes_rev += 1
         if mode == "create" and self._create_idx is not None:
             n = self.track.notes[self._create_idx]
             beat = self.project.sec_to_beat(self.sec_of(pos.x()))
@@ -772,7 +860,7 @@ class PianoRoll(QWidget):
             if pitch != n.pitch:
                 n.pitch = pitch
                 self._key_preview(pitch)
-            self.invalidate()
+            self.update()
             return
         if mode in ("move", "resize"):
             d_beat = self.project.sec_to_beat(self.sec_of(pos.x())) - self.project.sec_to_beat(self.sec_of(self._press.x()))
@@ -792,7 +880,7 @@ class PianoRoll(QWidget):
                 pitch = self.track.notes[self._drag_idx[0]].pitch
                 if pitch != self._preview_pitch:
                     self._key_preview(pitch)
-            self.invalidate()
+            self.update()
 
     def mouseReleaseEvent(self, e: QMouseEvent) -> None:
         mode = self._mode
@@ -803,42 +891,39 @@ class PianoRoll(QWidget):
                 if self._rubber.intersects(self._note_rect(n)):
                     self.selected.add(i)
             self._rubber = None
-            self.invalidate()
+            self.update()
             return
         if mode in ("create", "move", "resize", "erase") and self.track is not None:
             if mode == "create" and self._create_idx is not None:
                 self.default_len = self.track.notes[self._create_idx].length
             self._create_idx = None
-            if mode == "move" and not getattr(self, "_moved", True):
-                # plain click on a note: nothing changed
+            if mode == "move" and not self._moved:
                 st = self._undo.get(self.track.id)
                 if st:
                     st.pop()
-                self.invalidate()
+                self.update()
                 return
             self._commit()
-        self.invalidate()
-
-    def mouseDoubleClickEvent(self, e: QMouseEvent) -> None:
-        pass
+        self.update()
 
     def _erase_at(self, pos: QPointF) -> None:
         idx, _ = self._note_at(pos)
         if idx is not None and self.track is not None:
+            self._notes_rev += 1
             del self.track.notes[idx]
             self.selected = {i - 1 if i > idx else i for i in self.selected if i != idx}
-            self.invalidate()
+            self.update()
 
     def _key_preview(self, pitch: int) -> None:
         self._key_release()
         self._preview_pitch = pitch
-        if self.engine is not None and self.track is not None:
-            self.engine.preview_note(self.track, pitch, 100, duration=0.6)
-        self.invalidate()
+        if self.host is not None and self.track is not None:
+            self.host.preview_note(self.track, pitch, 100, duration=0.6)
+        self.update()
 
     def _key_release(self) -> None:
-        if self._preview_pitch is not None and self.engine is not None and self.track is not None:
-            self.engine.preview_off(self.track, self._preview_pitch)
+        if self._preview_pitch is not None and self.host is not None and self.track is not None:
+            self.host.preview_off(self.track, self._preview_pitch)
         self._preview_pitch = None
 
     def wheelEvent(self, e: QWheelEvent) -> None:
@@ -850,17 +935,19 @@ class PianoRoll(QWidget):
             factor = 1.15 if delta > 0 else 1 / 1.15
             self.pps = max(MIN_PPS, min(MAX_PPS, self.pps * factor))
             self.t0 = max(0.0, sec - (pos.x() - self.key_w) / self.pps)
+            self.invalidate()
         elif mods & Qt.KeyboardModifier.AltModifier:
             pitch_at = PITCH_HIGH - (pos.y() - RULER_H + self.scroll_y) / self.key_h
             self.key_h = max(MIN_KEY_H, min(MAX_KEY_H, self.key_h + (1 if delta > 0 else -1)))
             self.scroll_y = (PITCH_HIGH - pitch_at) * self.key_h - (pos.y() - RULER_H)
+            self.invalidate()
         elif mods & Qt.KeyboardModifier.ShiftModifier:
             self.t0 -= delta / 120.0 * (self.grid_width() / self.pps) * 0.15
         else:
             self.scroll_y -= delta / 120.0 * self.key_h * 3
         self.clamp_scroll()
         self.view_changed.emit()
-        self.invalidate()
+        self.update()
 
     # ------------------------------------------------------------------ keyboard
     def keyPressEvent(self, e: QKeyEvent) -> None:
@@ -879,7 +966,7 @@ class PianoRoll(QWidget):
             return
         if ctrl and k == Qt.Key.Key_A:
             self.selected = set(range(len(self.track.notes)))
-            self.invalidate()
+            self.update()
             return
         if ctrl and k == Qt.Key.Key_Z:
             self.undo()
@@ -911,12 +998,11 @@ class PianoRoll(QWidget):
             self._commit()
             return
         if ctrl and k == Qt.Key.Key_D and self.selected:
-            # duplicate selection right after itself
             self.push_undo()
             sel = [self.track.notes[i] for i in sorted(self.selected)]
             span = max(n.end for n in sel) - min(n.start for n in sel)
             if self.snap > 0:
-                span = max(self.snap, np.ceil(span / self.snap) * self.snap)
+                span = max(self.snap, math.ceil(span / self.snap) * self.snap)
             base = len(self.track.notes)
             for n in sel:
                 c = copy.copy(n)

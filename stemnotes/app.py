@@ -8,7 +8,7 @@ from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import paths
-from .audio.engine import Engine
+from .audio.host import AudioHost
 
 
 def dark_palette(app: QApplication) -> None:
@@ -53,11 +53,27 @@ def main(argv: list[str] | None = None) -> int:
             dlg.exec()
             sf = paths.find_soundfont()
 
-    engine = Engine()
+    import logging
+    import sys as _sys
+    import traceback as _tb
+    _log = logging.getLogger("stemnotes.app")
+
+    def _hook(exc_type, exc, tb):
+        _log.error("unhandled exception:\n%s", "".join(_tb.format_exception(exc_type, exc, tb)))
+        _sys.__excepthook__(exc_type, exc, tb)
+    _sys.excepthook = _hook
+
     settings = load_settings()
-    engine.start(settings.get("device"), settings.get("block"))
+    engine = AudioHost(inprocess=bool(settings.get("audio_inprocess", False)))
+    try:
+        engine.start(settings.get("device"), settings.get("block"))
+    except Exception as e:
+        engine.available, engine.error = False, str(e)
     if sf is not None:
-        engine.load_soundfont(sf)
+        try:
+            engine.load_soundfont(sf)
+        except Exception as e:
+            engine.error = f"SoundFont: {e}"
 
     win = MainWindow(engine)
     win.show()
@@ -71,7 +87,9 @@ def main(argv: list[str] | None = None) -> int:
             win._load_project(p)
         elif p.name == "project.json":
             win._load_project(p.parent)
-    return app.exec()
+    rc = app.exec()
+    engine.quit()
+    return rc
 
 
 if __name__ == "__main__":

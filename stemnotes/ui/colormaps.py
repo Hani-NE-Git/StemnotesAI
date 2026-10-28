@@ -51,6 +51,31 @@ class ImageCache:
         self._cache[key] = q
         return q
 
+    def get_level(self, img: PitchImage, lut: np.ndarray, level: int) -> tuple[QImage, int]:
+        """Down-sampled (max over 2**level columns) QImage for zoomed-out views. Returns (image, factor)."""
+        factor = 1 << level
+        if factor == 1:
+            return self.get(img, lut), 1
+        key = (id(img) ^ id(lut), level)
+        q = self._cache.get(key)
+        if q is not None:
+            return q, factor
+        data = img.data
+        if data.ndim != 2 or data.size == 0:
+            data = np.zeros((1, 1), dtype=np.uint8)
+        rows, cols = data.shape
+        n = (cols // factor) * factor
+        if n == 0:
+            small = data[:, :1]
+        else:
+            small = data[:, :n].reshape(rows, n // factor, factor).max(axis=2)
+        rgba = np.ascontiguousarray(lut[small[::-1]])
+        h, w = rgba.shape[:2]
+        q = QImage(rgba.data, w, h, w * 4, QImage.Format.Format_ARGB32)
+        self._keep[key] = rgba
+        self._cache[key] = q
+        return q, factor
+
     def clear(self) -> None:
         self._cache.clear()
         self._keep.clear()

@@ -58,3 +58,20 @@ def waveform_peaks(audio: np.ndarray, sample_rate: int, px_per_sec: float, t_sta
         out[i, 0] = seg.min()
         out[i, 1] = seg.max()
     return out
+
+
+def load_peaks(path: Path, sample_rate: int = 22050, chunk: int = 64) -> tuple[np.ndarray, np.ndarray, int]:
+    """Min/max per chunk of the mono signal, for waveform drawing. The decoded audio is not kept."""
+    key = (str(Path(path).resolve()), int(sample_rate))
+    cached = key in _cache
+    audio = load_audio(path, sample_rate)
+    mono = audio.mean(axis=1)
+    n = (len(mono) // chunk) * chunk
+    if n == 0:
+        mins, maxs = np.zeros(1, np.float32), np.zeros(1, np.float32)
+    else:
+        m = mono[:n].reshape(-1, chunk)
+        mins, maxs = m.min(axis=1), m.max(axis=1)
+    if not cached:
+        _cache.pop(key, None)
+    return mins.astype(np.float32), maxs.astype(np.float32), int(sample_rate)

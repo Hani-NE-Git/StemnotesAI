@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QComboBox, QDockW
                                QToolBar, QToolButton, QWidget, QInputDialog)
 
 from .. import paths
-from ..audio.engine import Engine
+from ..audio.host import AudioHost
+from ..log import get as _get_log
 from ..midi_export import export_midi
 from ..project import Project, Track, N_PITCHES
 from .dialogs import AnalysisDialog, InstrumentDialog, SettingsDialog, UpdateDialog
@@ -40,8 +41,11 @@ def save_settings(s: dict) -> None:
         pass
 
 
+log = _get_log("ui")
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, engine: Engine):
+    def __init__(self, engine: AudioHost):
         super().__init__()
         self.engine = engine
         self.project: Project | None = None
@@ -98,8 +102,6 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(33)
-        self.engine.on_vst_rendered = lambda tid: None
-        self.engine.on_stopped = lambda: None
         QApplication.instance().installEventFilter(self)   # Space / Home work wherever the focus is
 
     def eventFilter(self, obj, ev) -> bool:
@@ -211,7 +213,7 @@ class MainWindow(QMainWindow):
         vol.setRange(0, 100)
         vol.setValue(int(self.engine.master * 100))
         vol.setFixedWidth(90)
-        vol.valueChanged.connect(lambda v: setattr(self.engine, "master", v / 100.0))
+        vol.valueChanged.connect(lambda v: self.engine.set_master(v / 100.0))
         tb.addWidget(vol)
         act("Звук…", self.audio_settings, None, "Выбор устройства вывода и размера буфера")
         act("Обновить", self.check_updates, None, "Обновить код программы из GitHub (модели и настройки сохраняются)")
@@ -219,11 +221,23 @@ class MainWindow(QMainWindow):
         self.vst_btn.setToolTip("Открыть интерфейс VST3-плагина активной дорожки")
         self.vst_btn.clicked.connect(self.open_vst_editor)
         tb.addWidget(self.vst_btn)
+        self.vst_test_btn = QPushButton("Тест VST")
+        self.vst_test_btn.setToolTip("Прогнать одну ноту через VST3 активной дорожки и показать, вернул ли плагин звук")
+        self.vst_test_btn.clicked.connect(self.test_vst)
+        tb.addWidget(self.vst_test_btn)
 
     # ------------------------------------------------------------------ project lifecycle
     def set_project(self, project: Project | None) -> None:
         self.project = project
-        self.engine.set_project(project) if project else None
+        if project is not None:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                self.engine.set_project(project)
+            except Exception as e:
+                log.exception("set_project failed")
+                QMessageBox.warning(self, "Звук", f"Не удалось передать проект аудиопроцессу:\n{e}")
+            finally:
+                QApplication.restoreOverrideCursor()
         self.roll.set_project(project, self.engine)
         self.tracks.set_project(project)
         if project is not None:
@@ -293,8 +307,8 @@ class MainWindow(QMainWindow):
         if self.project is None:
             return
         for t in self.project.midi_tracks():
-            if t.instrument.get("type") == "vst3" and t.id in self.engine.vst:
-                st = self.engine.vst[t.id].get_state()
+            if t.instrument.get("type") == "vst3" and self.engine.has_vst(t.id):
+                st = self.engine.vst_state(t.id)
                 if st:
                     t.instrument["state"] = st
         self.project.save()
@@ -310,7 +324,7 @@ class MainWindow(QMainWindow):
             if r == QMessageBox.StandardButton.Yes:
                 self.save_project()
         self.engine.stop()
-        self.engine.stop_stream()
+        self.engine.quit()
         e.accept()
 
     # ------------------------------------------------------------------ analysis / export
@@ -335,6 +349,7 @@ class MainWindow(QMainWindow):
     def _analysis_done(self) -> None:
         self.project.analysis.load()
         self.set_project(self.project)
+        self.roll.invalidate()
         self.statusBar().showMessage("Анализ завершён", 5000)
 
     def export_midi(self) -> None:
@@ -411,6 +426,29 @@ class MainWindow(QMainWindow):
             self._update_play_btn()
         if self.engine.vst_rendering:
             self.statusBar().showMessage("Рендер VST3-дорожки…", 500)
+        for name, payload in self.engine.poll_events():
+            self._audio_event(name, payload)
+
+    def _audio_event(self, name: str, payload: dict) -> None:
+        if name == "error":
+            log.error("audio event error: %s", payload.get("message"))
+            QMessageBox.warning(self, "Звук / VST3", payload.get("message", "ошибка"))
+        elif name == "warning":
+            self.statusBar().showMessage(payload.get("message", ""), 10000)
+            log.warning("audio warning: %s", payload.get("message"))
+        elif name == "vst_rendered":
+            self.statusBar().showMessage("VST3-дорожка отрендерена", 2000)
+        elif name == "editor_closed":
+            tid = payload.get("track_id")
+            t = self.project.track_by_id(tid) if self.project else None
+            if not payload.get("ok"):
+                QMessageBox.warning(self, "VST3", f"Не удалось открыть окно плагина:\n{payload.get('error')}")
+            elif t is not None:
+                t.instrument["state"] = payload.get("state")
+                self.project.dirty = True
+                self.statusBar().showMessage("Окно плагина закрыто, настройки сохранены в проект", 4000)
+        elif name == "server_gone":
+            QMessageBox.critical(self, "Звук", "Аудиопроцесс завершился. Перезапустите программу. Подробности в logs\\stemnotes.log")
 
     # ------------------------------------------------------------------ edits
     def _bpm_changed(self, v: float) -> None:
@@ -418,8 +456,7 @@ class MainWindow(QMainWindow):
             return
         self.project.bpm = v
         self.project.dirty = True
-        self.engine.rebuild_events()
-        self.engine.mark_all_vst_dirty()
+        self.engine.sync()
         self.roll.invalidate()
 
     def _offset_changed(self, v: float) -> None:
@@ -427,26 +464,27 @@ class MainWindow(QMainWindow):
             return
         self.project.offset = v
         self.project.dirty = True
-        self.engine.rebuild_events()
-        self.engine.mark_all_vst_dirty()
+        self.engine.sync()
         self.roll.invalidate()
 
     def _notes_changed(self, tid: str) -> None:
-        self.engine.rebuild_events()
-        self.engine.mark_vst_dirty(tid)
-        self.engine.kick_vst_render()
+        self.engine.sync()
+        if self.roll.layers.others.on:
+            self.roll.invalidate()
 
     def _mix_changed(self) -> None:
         if self.project:
             self.project.dirty = True
-        self.engine.update_mix()
+        self.engine.sync()
 
     def _track_selected(self, tid: str) -> None:
         if self.project is None:
             return
         t = self.project.track_by_id(tid)
         self.roll.set_track(t)
-        self.vst_btn.setEnabled(t is not None and t.kind == "midi" and t.instrument.get("type") == "vst3")
+        is_vst = t is not None and t.kind == "midi" and t.instrument.get("type") == "vst3"
+        self.vst_btn.setEnabled(is_vst)
+        self.vst_test_btn.setEnabled(is_vst)
 
     def _import_ghosts(self, engines, only_loop: bool, snap: bool) -> None:
         if self.project is None or self.roll.track is None:
@@ -466,10 +504,8 @@ class MainWindow(QMainWindow):
         try:
             if inst["type"] == "vst3":
                 QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-                names = []
                 try:
-                    from ..audio.vst import VSTInstrument
-                    names = VSTInstrument.plugin_names(inst["path"])
+                    names = self.engine.vst_names(inst["path"])
                 finally:
                     QApplication.restoreOverrideCursor()
                 plugin_name = None
@@ -479,15 +515,17 @@ class MainWindow(QMainWindow):
                         return
                 QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
                 try:
-                    self.engine.replace_vst(t, inst["path"], plugin_name)
+                    r = self.engine.replace_vst(t, inst["path"], plugin_name)
                 finally:
                     QApplication.restoreOverrideCursor()
+                if not r.get("ok"):
+                    raise RuntimeError(r.get("error"))
+                self.statusBar().showMessage(f"VST3 загружен: {r.get('name')}. Кнопка «Окно VST» открывает его интерфейс, «Тест VST» проверяет звук.", 8000)
             else:
                 t.instrument = inst
-                self.engine.refresh_instruments()
-                self.engine.rebuild_events()
+            self.engine.sync()
         except Exception as e:
-            traceback.print_exc()
+            log.exception("instrument change failed")
             QMessageBox.critical(self, "Инструмент", f"Не удалось загрузить:\n{e}")
             return
         self.project.dirty = True
@@ -497,22 +535,31 @@ class MainWindow(QMainWindow):
 
     def open_vst_editor(self) -> None:
         tid = self.tracks.active_id
-        inst = self.engine.vst.get(tid) if tid else None
-        if inst is None:
-            self.statusBar().showMessage("У активной дорожки нет VST3-инструмента", 3000)
+        if not tid or not self.engine.has_vst(tid):
+            self.statusBar().showMessage("У активной дорожки нет VST3-инструмента (кнопка инструмента → вкладка VST3)", 4000)
             return
         self.engine.stop()
-        self.statusBar().showMessage("Окно плагина открыто. Закройте его, чтобы вернуться.", 3000)
+        self.statusBar().showMessage("Окно плагина открыто в аудиопроцессе. Закройте его, чтобы применить настройки.", 6000)
+        self.engine.show_editor(tid)
+
+    def test_vst(self) -> None:
+        tid = self.tracks.active_id
+        if not tid or not self.engine.has_vst(tid):
+            self.statusBar().showMessage("У активной дорожки нет VST3-инструмента", 4000)
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            inst.show_editor()
+            r = self.engine.test_vst(tid)
         except Exception as e:
-            QMessageBox.warning(self, "VST3", f"Не удалось открыть окно плагина:\n{e}")
-        t = self.project.track_by_id(tid)
-        if t is not None:
-            t.instrument["state"] = inst.get_state()
-            self.project.dirty = True
-            self.engine.mark_vst_dirty(tid)
-            self.engine.kick_vst_render()
+            r = {"ok": False, "error": str(e)}
+        finally:
+            QApplication.restoreOverrideCursor()
+        if r.get("ok"):
+            verdict = "плагин выдаёт звук" if r["peak"] > 1e-4 else "ТИШИНА: откройте окно плагина и выберите пресет/инструмент"
+            QMessageBox.information(self, "Тест VST3", f"{r.get('name')}\nСэмплов: {r['samples']}, пик: {r['peak']:.3f}, "
+                                    f"время рендера: {r['seconds']:.2f} с, параметров: {r.get('params')}\n\n{verdict}")
+        else:
+            QMessageBox.warning(self, "Тест VST3", f"Ошибка: {r.get('error')}\n\nПодробности в logs\\stemnotes.log")
 
     def _add_midi_track(self) -> None:
         if self.project is None:
@@ -521,7 +568,7 @@ class MainWindow(QMainWindow):
         t = Track(name=f"MIDI {n}", kind="midi", instrument={"type": "sf2", "bank": 0, "program": 0, "drums": False},
                   ghost_source=self.roll.active_source())
         self.project.add_track(t)
-        self.engine.refresh_instruments()
+        self.engine.sync()
         self.tracks.rebuild()
         self.tracks.select(t.id)
 
@@ -535,10 +582,11 @@ class MainWindow(QMainWindow):
         self.project.add_track(t)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            self.engine.reload_audio()
+            self.engine.sync()
         finally:
             QApplication.restoreOverrideCursor()
         self.tracks.rebuild()
+        self.roll.invalidate()
 
     def _remove_track(self, tid: str) -> None:
         if self.project is None:
@@ -550,8 +598,7 @@ class MainWindow(QMainWindow):
             return
         self.project.tracks.remove(t)
         self.project.dirty = True
-        self.engine.refresh_instruments()
-        self.engine.rebuild_events()
+        self.engine.sync()
         self.tracks.active_id = None
         self.tracks.rebuild()
         if self.tracks.active_id:
@@ -568,7 +615,10 @@ class MainWindow(QMainWindow):
             self.settings["device"] = dlg.device()
             self.settings["block"] = dlg.block()
             save_settings(self.settings)
-            self.engine.start(dlg.device(), dlg.block())
+            try:
+                self.engine.start(dlg.device(), dlg.block())
+            except Exception as e:
+                self.engine.available, self.engine.error = False, str(e)
             if not self.engine.available:
                 QMessageBox.warning(self, "Звук", f"Не удалось открыть устройство:\n{self.engine.error}")
 

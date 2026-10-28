@@ -272,16 +272,22 @@ class Project:
         self.dirty = False
 
     @classmethod
-    def load(cls, directory: Path) -> "Project":
+    def from_dict(cls, directory: Path, d: dict, load_analysis: bool = False) -> "Project":
         directory = Path(directory)
-        if directory.is_file():
-            directory = directory.parent
-        d = json.loads((directory / "project.json").read_text(encoding="utf-8"))
         p = cls(directory, d.get("name", directory.name))
         p.bpm = float(d.get("bpm", 120.0))
         p.offset = float(d.get("offset", 0.0))
         p.beats_per_bar = int(d.get("beats_per_bar", 4))
         p.song_path = d.get("song_path")
         p.tracks = [Track.from_json(t) for t in d.get("tracks", [])]
-        p.analysis.load()
+        if load_analysis:
+            p.analysis.load()
         return p
+
+    @classmethod
+    def load(cls, directory: Path) -> "Project":
+        directory = Path(directory)
+        if directory.is_file():
+            directory = directory.parent
+        d = json.loads((directory / "project.json").read_text(encoding="utf-8"))
+        return cls.from_dict(directory, d, load_analysis=True)

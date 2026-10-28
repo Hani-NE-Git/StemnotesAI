@@ -10,10 +10,13 @@ from typing import Callable
 
 import numpy as np
 
+from ..log import get as _get_log
 from ..project import Project, Track
 from .loader import load_audio
 from .sf2 import SF2Synth
 from .vst import VSTInstrument
+
+log = _get_log("engine")
 
 DEFAULT_BLOCK = 1024
 
@@ -54,7 +57,9 @@ def pick_default_device() -> int | None:
 
 
 class Engine:
-    def __init__(self):
+    def __init__(self, shared=None):
+        self.shared = shared                  # optional: object with pos/playing/rendering/end multiprocessing Values
+        self.events_out: list[tuple[str, dict]] = []   # async events for the UI (vst_rendered, stopped, error)
         self.project: Project | None = None
         self.sample_rate = 44100
         self.block = DEFAULT_BLOCK
@@ -128,6 +133,10 @@ class Engine:
             self.available = False
             self.error = str(e)
             self.stream = None
+            log.error("audio device open failed (device=%s block=%s): %s", self.device, self.block, e)
+        if self.available:
+            log.info("audio stream started: device=%s sr=%d block=%d latency=%s", self.device, self.sample_rate, self.block,
+                     getattr(self.stream, "latency", "?"))
         if self.soundfont is not None:
             self.load_soundfont(self.soundfont)
         if self.project is not None:
@@ -152,6 +161,7 @@ class Engine:
             except Exception as e:
                 self.synth = None
                 self.error = f"SoundFont: {e}"
+                log.error("soundfont load failed %s: %s", path, e)
             self.sf2_channels.clear()
         if self.project is not None:
             self.refresh_instruments()
@@ -168,6 +178,20 @@ class Engine:
         self.reload_audio()
         self.refresh_instruments()
         self.rebuild_events()
+
+    def update_project(self, project: Project, reload_audio: bool = False, dirty_vst: set[str] | None = None) -> None:
+        """Replace project data without stopping playback (edits, mix changes, instrument changes)."""
+        with self.lock:
+            self.project = project
+        if reload_audio:
+            self.reload_audio()
+        self.refresh_instruments()
+        self.rebuild_events()
+        if dirty_vst:
+            with self.lock:
+                self.vst_dirty.update(t for t in dirty_vst if t in self.vst)
+            self.kick_vst_render()
+        self.update_mix()
 
     def reload_audio(self) -> None:
         if self.project is None:
@@ -208,13 +232,16 @@ class Engine:
                         used.discard(self.sf2_channels.pop(t.id))
                     if t.id not in self.vst and inst.get("path"):
                         try:
+                            log.info("loading VST3 for track %s: %s (%s)", t.name, inst["path"], inst.get("plugin_name"))
                             v = VSTInstrument(inst["path"], inst.get("plugin_name"))
                             v.set_state(inst.get("state"))
                             self.vst[t.id] = v
                             self.vst_dirty.add(t.id)
+                            log.info("VST3 loaded: %s", v.name)
                         except Exception as e:
-                            traceback.print_exc()
+                            log.exception("VST3 load failed for track %s", t.name)
                             self.error = f"VST3: {e}"
+                            self.events_out.append(("error", {"message": f"VST3 «{inst.get('path')}»: {e}"}))
             # drop stale
             ids = {t.id for t in self.project.tracks}
             for tid in list(self.sf2_channels):
@@ -228,7 +255,9 @@ class Engine:
         self.kick_vst_render()
 
     def replace_vst(self, track: Track, path: str, plugin_name: str | None) -> VSTInstrument:
+        log.info("replace_vst track=%s path=%s plugin=%s", track.name, path, plugin_name)
         v = VSTInstrument(path, plugin_name)
+        log.info("VST3 loaded: %s (instrument=%s)", v.name, getattr(v.plugin, "is_instrument", "?"))
         track.instrument = {"type": "vst3", "path": path, "plugin_name": plugin_name, "state": None, "name": v.name}
         with self.lock:
             self.vst[track.id] = v
@@ -261,6 +290,8 @@ class Engine:
                 for n in t.notes:
                     end = max(end, int((self.project.beat_to_sec(n.end) + 2.0) * self.sample_rate))
         self.end_sample = max(end, self.sample_rate * 10)
+        if self.shared is not None:
+            self.shared.end.value = self.end_sample / self.sample_rate
 
     def rebuild_events(self) -> None:
         """Rebuild the SF2 event list from project notes (call after any note edit)."""
@@ -319,16 +350,30 @@ class Engine:
                 with self.lock:
                     self.vst_rendering.discard(tid)
                 continue
+            if self.shared is not None:
+                self.shared.rendering.value = len(self.vst_rendering)
             try:
+                import time
+                t0 = time.time()
                 events = [(proj.beat_to_sec(n.start), proj.beat_to_sec(n.end), n.pitch, n.velocity) for n in track.notes]
                 events = [e for e in events if e[1] > 0]
                 buf = inst.render(events, self.sample_rate) if events else np.zeros((0, 2), dtype=np.float32)
-            except Exception:
-                traceback.print_exc()
+                peak = float(np.abs(buf).max()) if len(buf) else 0.0
+                log.info("VST3 render track=%s notes=%d -> %.1fs audio, peak=%.3f, took %.1fs", track.name, len(events),
+                         len(buf) / self.sample_rate, peak, time.time() - t0)
+                if events and peak < 1e-4:
+                    self.events_out.append(("warning", {"message": f"VST3 «{inst.name}» на дорожке «{track.name}» вернул тишину. "
+                                                        "Откройте окно плагина и выберите пресет/звук."}))
+            except Exception as e:
+                log.exception("VST3 render failed for track %s", track.name)
+                self.events_out.append(("error", {"message": f"Рендер VST3 «{track.name}»: {e}"}))
                 buf = np.zeros((0, 2), dtype=np.float32)
             with self.lock:
                 self.vst_buffers[tid] = buf
                 self.vst_rendering.discard(tid)
+            if self.shared is not None:
+                self.shared.rendering.value = len(self.vst_rendering)
+            self.events_out.append(("vst_rendered", {"track_id": tid}))
             if self.on_vst_rendered:
                 try:
                     self.on_vst_rendered(tid)
@@ -347,12 +392,16 @@ class Engine:
         with self.lock:
             self.ev_idx = bisect.bisect_left(self.event_times, self.pos)
             self.playing = True
+        if self.shared is not None:
+            self.shared.playing.value = True
 
     def stop(self) -> None:
         with self.lock:
             self.playing = False
             if self.synth is not None:
                 self.synth.all_notes_off()
+        if self.shared is not None:
+            self.shared.playing.value = False
 
     def toggle(self) -> None:
         if self.playing:
@@ -366,6 +415,8 @@ class Engine:
             self.ev_idx = bisect.bisect_left(self.event_times, self.pos)
             if self.synth is not None:
                 self.synth.all_notes_off()
+        if self.shared is not None:
+            self.shared.pos.value = self.pos / self.sample_rate
 
     def set_loop(self, enabled: bool, start_sec: float | None = None, end_sec: float | None = None) -> None:
         with self.lock:
@@ -398,8 +449,9 @@ class Engine:
                     buf = inst.render([(0.0, duration, pitch, velocity)], self.sample_rate, tail=1.0)
                     with self.lock:
                         self.oneshots.append([buf * float(track.volume), 0])
-                except Exception:
-                    traceback.print_exc()
+                except Exception as e:
+                    log.exception("VST3 preview failed")
+                    self.events_out.append(("error", {"message": f"VST3 предпрослушивание: {e}"}))
             threading.Thread(target=work, daemon=True).start()
 
     def preview_off(self, track: Track, pitch: int) -> None:
@@ -407,6 +459,23 @@ class Engine:
         if ch is not None:
             with self.lock:
                 self.immediate.append((0, ch, pitch, 0))
+
+    def test_vst(self, track: Track) -> dict:
+        """Render one note through the track's VST3 and report what came back (for diagnostics)."""
+        inst = self.vst.get(track.id)
+        if inst is None:
+            return {"ok": False, "error": "на дорожке нет VST3-инструмента"}
+        try:
+            import time
+            t0 = time.time()
+            buf = inst.render([(0.0, 0.5, 60, 100)], self.sample_rate, tail=1.0)
+            peak = float(np.abs(buf).max()) if len(buf) else 0.0
+            log.info("VST3 test %s: %d samples, peak %.4f, %.2fs", inst.name, len(buf), peak, time.time() - t0)
+            return {"ok": True, "name": inst.name, "samples": int(len(buf)), "peak": peak, "seconds": time.time() - t0,
+                    "params": len(getattr(inst.plugin, "parameters", {}) or {})}
+        except Exception as e:
+            log.exception("VST3 test failed")
+            return {"ok": False, "name": inst.name, "error": str(e)}
 
     # ------------------------------------------------------------------ callback
     def _callback(self, outdata, frames, time_info, status) -> None:
@@ -475,6 +544,12 @@ class Engine:
                             keep.append(item)
                 self.oneshots = keep
             self.clock += frames
+        if self.shared is not None:
+            self.shared.pos.value = self.pos / self.sample_rate
+            if stopped:
+                self.shared.playing.value = False
+        if stopped:
+            self.events_out.append(("stopped", {}))
         np.multiply(out, self.master, out=out)
         peak = float(np.abs(out).max()) if frames else 0.0
         if peak > 0.98:               # gentle per-block limiter: no harsh clipping when many stems are summed

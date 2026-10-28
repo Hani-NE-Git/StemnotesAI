@@ -44,7 +44,16 @@ class LayersPanel(QWidget):
     def __init__(self, settings: LayerSettings, parent=None):
         super().__init__(parent)
         self.s = settings
-        lay = QVBoxLayout(self)
+        from PySide6.QtWidgets import QScrollArea
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        inner = QWidget()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+        lay = QVBoxLayout(inner)
         lay.setContentsMargins(6, 6, 6, 6)
 
         src_box = QGroupBox("Источник фона")
@@ -146,6 +155,7 @@ class LayersPanel(QWidget):
         """Rebuild the per-engine checkboxes from the engines present in the analysis."""
         for cb in self.eng_checks.values():
             self.eng_lay.removeWidget(cb)
+            cb.hide()
             cb.deleteLater()
         self.eng_checks.clear()
         self.eng_hint.setVisible(not engine_ids)

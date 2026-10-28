@@ -295,14 +295,13 @@ class AnalysisDialog(QDialog):
 class SettingsDialog(QDialog):
     def __init__(self, engine, settings: dict, parent=None):
         super().__init__(parent)
-        from ..audio.engine import list_output_devices
         self.setWindowTitle("Настройки звука")
         self.resize(480, 160)
         self.settings = settings
         lay = QFormLayout(self)
         self.dev = QComboBox()
         self.dev.addItem("Авто (WASAPI shared / системное по умолчанию)", None)
-        for d in list_output_devices():
+        for d in engine.devices():
             self.dev.addItem(f"[{d['hostapi']}] {d['name']}", d["index"])
         idx = self.dev.findData(settings.get("device"))
         self.dev.setCurrentIndex(max(0, idx))
@@ -314,7 +313,8 @@ class SettingsDialog(QDialog):
         self.buf.setCurrentIndex(max(0, self.buf.findData(settings.get("block", engine.block))))
         self.buf.setToolTip("Больше буфер — меньше хрипов и щелчков, но больше задержка при прослушивании нот")
         lay.addRow("Буфер:", self.buf)
-        status = QLabel(("Работает, %d Гц" % engine.sample_rate) if engine.available else f"Нет звука: {engine.error}")
+        status = QLabel(("Работает, %d Гц, буфер %d, отдельный аудиопроцесс: %s" % (engine.sample_rate, engine.block, "да" if not engine.inprocess else "нет"))
+                        if engine.available else f"Нет звука: {engine.error}")
         status.setWordWrap(True)
         lay.addRow("Состояние:", status)
         lay.addRow(QLabel("Используется общий режим (без ASIO и без захвата устройства)."))
