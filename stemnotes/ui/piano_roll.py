@@ -54,29 +54,53 @@ class LayerSettings:
 
 
 class PeakStore:
-    """Waveform peaks per audio file (min/max per 64 samples), loaded once, audio itself is not kept."""
+    """Waveform peaks per audio file (min/max per 64 samples), decoded in a background thread so painting never
+    blocks; `ready` is called (from the worker) when a file is done."""
 
-    def __init__(self):
+    def __init__(self, ready=None):
+        import threading
         self._peaks: dict[str, tuple[np.ndarray, np.ndarray, int]] = {}
         self._failed: set[str] = set()
+        self._loading: set[str] = set()
+        self._lock = threading.Lock()
+        self._ready = ready
 
     def get(self, path) -> tuple[np.ndarray, np.ndarray, int] | None:
-        key = str(path)
-        if key in self._peaks:
-            return self._peaks[key]
-        if key in self._failed:
+        if path is None:
             return None
+        key = str(path)
+        with self._lock:
+            if key in self._peaks:
+                return self._peaks[key]
+            if key in self._failed or key in self._loading:
+                return None
+            self._loading.add(key)
+        import threading
+        threading.Thread(target=self._work, args=(key, path), daemon=True).start()
+        return None
+
+    def _work(self, key: str, path) -> None:
         try:
-            self._peaks[key] = load_peaks(path, 22050, 64)
+            res = load_peaks(path)
+            with self._lock:
+                self._peaks[key] = res
         except Exception:
             log.exception("peaks failed for %s", path)
-            self._failed.add(key)
-            return None
-        return self._peaks[key]
+            with self._lock:
+                self._failed.add(key)
+        finally:
+            with self._lock:
+                self._loading.discard(key)
+        if self._ready is not None:
+            try:
+                self._ready()
+            except Exception:
+                pass
 
     def clear(self) -> None:
-        self._peaks.clear()
-        self._failed.clear()
+        with self._lock:
+            self._peaks.clear()
+            self._failed.clear()
 
 
 class GhostArrays:
@@ -106,6 +130,7 @@ class PianoRoll(QWidget):
     loop_changed = Signal(bool, float, float)
     status = Signal(str)
     view_changed = Signal()
+    peaks_ready = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -116,7 +141,8 @@ class PianoRoll(QWidget):
         self.track: Track | None = None
         self.layers = LayerSettings()
         self.images = ImageCache()
-        self.peaks = PeakStore()
+        self.peaks = PeakStore(ready=self.peaks_ready.emit)
+        self.peaks_ready.connect(self.invalidate)
         self.ghost_arrays = GhostArrays()
 
         self.key_w = KEY_W_NOTES

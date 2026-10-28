@@ -328,6 +328,11 @@ class Engine:
 
     # ------------------------------------------------------------------ VST rendering (background)
     def kick_vst_render(self) -> None:
+        # Pedalboard requires plugin resets on the main thread; do them here, the worker renders with reset=False
+        with self.lock:
+            dirty = [self.vst[t] for t in self.vst_dirty if t in self.vst]
+        for inst in dirty:
+            inst.reset()
         if self._vst_thread is not None and self._vst_thread.is_alive():
             return
         with self.lock:

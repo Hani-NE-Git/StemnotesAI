@@ -230,14 +230,7 @@ class MainWindow(QMainWindow):
     def set_project(self, project: Project | None) -> None:
         self.project = project
         if project is not None:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            try:
-                self.engine.set_project(project)
-            except Exception as e:
-                log.exception("set_project failed")
-                QMessageBox.warning(self, "Звук", f"Не удалось передать проект аудиопроцессу:\n{e}")
-            finally:
-                QApplication.restoreOverrideCursor()
+            self._load_into_audio(project)
         self.roll.set_project(project, self.engine)
         self.tracks.set_project(project)
         if project is not None:
@@ -250,6 +243,39 @@ class MainWindow(QMainWindow):
                 self._track_selected(self.tracks.active_id)
         self._sync_bars()
         self.roll.invalidate()
+
+    def _load_into_audio(self, project: Project) -> None:
+        """Send the project to the audio process in a background thread; the window stays responsive."""
+        import threading
+        from PySide6.QtWidgets import QProgressDialog
+        dlg = QProgressDialog("Загрузка аудио и инструментов в аудиопроцесс…", "", 0, 0, self)
+        dlg.setWindowTitle("StemNotes")
+        dlg.setCancelButton(None)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(300)
+        result: dict = {}
+
+        def work():
+            try:
+                self.engine.set_project(project)
+            except Exception as e:
+                log.exception("set_project failed")
+                result["error"] = str(e)
+            result["done"] = True
+        threading.Thread(target=work, daemon=True).start()
+        t = QTimer(self)
+
+        def poll():
+            if result.get("done"):
+                t.stop()
+                dlg.close()
+                if result.get("error"):
+                    QMessageBox.warning(self, "Звук", f"Не удалось передать проект аудиопроцессу:\n{result['error']}")
+                self.statusBar().showMessage("Проект загружен в аудиопроцесс", 3000)
+                self._track_selected(self.tracks.active_id) if self.tracks.active_id else None
+        t.timeout.connect(poll)
+        t.start(100)
+        dlg.show()
 
     def open_song(self) -> None:
         start = self.settings.get("last_dir", str(Path.home()))
@@ -431,8 +457,15 @@ class MainWindow(QMainWindow):
 
     def _audio_event(self, name: str, payload: dict) -> None:
         if name == "error":
-            log.error("audio event error: %s", payload.get("message"))
-            QMessageBox.warning(self, "Звук / VST3", payload.get("message", "ошибка"))
+            import time
+            msg = payload.get("message", "ошибка")
+            log.error("audio event error: %s", msg)
+            last = getattr(self, "_last_err", (None, 0.0))
+            if msg == last[0] and time.time() - last[1] < 15:
+                self.statusBar().showMessage(msg, 5000)      # same error again: status bar only
+                return
+            self._last_err = (msg, time.time())
+            QMessageBox.warning(self, "Звук / VST3", msg)
         elif name == "warning":
             self.statusBar().showMessage(payload.get("message", ""), 10000)
             log.warning("audio warning: %s", payload.get("message"))

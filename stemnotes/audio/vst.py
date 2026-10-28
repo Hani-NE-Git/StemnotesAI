@@ -48,11 +48,21 @@ class VSTInstrument:
         with self.lock:
             self.plugin.show_editor()
 
-    def render(self, events: list[tuple[float, float, int, int]], sample_rate: int, tail: float = 2.0) -> np.ndarray:
-        """events: (start_sec, end_sec, pitch, velocity) with start_sec >= 0. Returns (n, 2) float32."""
+    def reset(self) -> None:
+        """Must be called on the main thread (some plugins reload themselves on reset)."""
+        with self.lock:
+            try:
+                self.plugin.reset()
+            except Exception:
+                pass
+
+    def render(self, events: list[tuple[float, float, int, int]], sample_rate: int, tail: float = 2.0,
+               reset: bool = False) -> np.ndarray:
+        """events: (start_sec, end_sec, pitch, velocity) with start_sec >= 0. Returns (n, 2) float32.
+        reset=False so that rendering is allowed from worker threads (Pedalboard forbids reset there)."""
         if not events:
             return np.zeros((0, 2), dtype=np.float32)
-        msgs: list[tuple[bytes, float]] = []
+        msgs: list[tuple[bytes, float]] = [(bytes([0xB0, 123, 0]), 0.0)]   # all notes off: clean start without reset
         end = 0.0
         for s, e, p, v in events:
             s = max(0.0, s)
@@ -63,7 +73,7 @@ class VSTInstrument:
         msgs.sort(key=lambda m: m[1])
         duration = end + tail
         with self.lock:
-            out = self.plugin(msgs, duration, float(sample_rate), num_channels=2, reset=True)
+            out = self.plugin(msgs, duration, float(sample_rate), num_channels=2, reset=reset)
         out = np.asarray(out, dtype=np.float32)
         if out.ndim == 1:
             out = out[None, :]

@@ -8,23 +8,40 @@ import numpy as np
 _cache: dict[tuple[str, int], np.ndarray] = {}
 
 
-def load_audio(path: Path, sample_rate: int) -> np.ndarray:
-    """Returns float32 array of shape (n, 2) resampled to sample_rate."""
-    key = (str(Path(path).resolve()), int(sample_rate))
-    if key in _cache:
-        return _cache[key]
+def decode(path: Path) -> tuple[np.ndarray, int]:
+    """Decode at native sample rate: (n, channels) float32, sr. wav/flac via soundfile, others via pedalboard."""
+    path = Path(path)
+    if path.suffix.lower() in (".wav", ".flac", ".ogg"):
+        try:
+            import soundfile as sf
+            data, sr = sf.read(str(path), dtype="float32", always_2d=True)
+            return np.ascontiguousarray(data), int(sr)
+        except Exception:
+            pass
     from pedalboard.io import AudioFile
     with AudioFile(str(path)) as f:
-        with f.resampled_to(sample_rate) as r:
-            data = r.read(int(r.frames))  # (channels, n)
+        data = f.read(int(f.frames))      # (channels, n)
+        sr = int(f.samplerate)
     data = np.asarray(data, dtype=np.float32)
     if data.ndim == 1:
         data = data[None, :]
-    if data.shape[0] == 1:
-        data = np.repeat(data, 2, axis=0)
-    elif data.shape[0] > 2:
-        data = data[:2]
-    out = np.ascontiguousarray(data.T)
+    return np.ascontiguousarray(data.T), sr
+
+
+def load_audio(path: Path, sample_rate: int) -> np.ndarray:
+    """Returns float32 array of shape (n, 2) resampled to sample_rate (soxr, fast)."""
+    key = (str(Path(path).resolve()), int(sample_rate))
+    if key in _cache:
+        return _cache[key]
+    data, sr = decode(path)
+    if data.shape[1] == 1:
+        data = np.repeat(data, 2, axis=1)
+    elif data.shape[1] > 2:
+        data = data[:, :2]
+    if sr != sample_rate:
+        import soxr
+        data = soxr.resample(data, sr, sample_rate).astype(np.float32)
+    out = np.ascontiguousarray(data, dtype=np.float32)
     _cache[key] = out
     return out
 
@@ -60,18 +77,14 @@ def waveform_peaks(audio: np.ndarray, sample_rate: int, px_per_sec: float, t_sta
     return out
 
 
-def load_peaks(path: Path, sample_rate: int = 22050, chunk: int = 64) -> tuple[np.ndarray, np.ndarray, int]:
-    """Min/max per chunk of the mono signal, for waveform drawing. The decoded audio is not kept."""
-    key = (str(Path(path).resolve()), int(sample_rate))
-    cached = key in _cache
-    audio = load_audio(path, sample_rate)
-    mono = audio.mean(axis=1)
+def load_peaks(path: Path, sample_rate: int = 0, chunk: int = 64) -> tuple[np.ndarray, np.ndarray, int]:
+    """Min/max per chunk of the mono signal at the file's native rate (no resampling, nothing cached)."""
+    data, sr = decode(path)
+    mono = data.mean(axis=1)
     n = (len(mono) // chunk) * chunk
     if n == 0:
         mins, maxs = np.zeros(1, np.float32), np.zeros(1, np.float32)
     else:
         m = mono[:n].reshape(-1, chunk)
         mins, maxs = m.min(axis=1), m.max(axis=1)
-    if not cached:
-        _cache.pop(key, None)
-    return mins.astype(np.float32), maxs.astype(np.float32), int(sample_rate)
+    return mins.astype(np.float32), maxs.astype(np.float32), int(sr)
