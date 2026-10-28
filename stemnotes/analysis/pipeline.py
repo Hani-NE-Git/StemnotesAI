@@ -175,12 +175,12 @@ def run_analysis(project: Project, opt: AnalysisOptions, progress: Callable[[flo
         from .engines import ENGINES, run_engine
         chosen = [e for e in ENGINES if e.available() and (opt.engines is None and e.default_on or opt.engines is not None and e.id in opt.engines)]
         jobs = [(e, role) for e in chosen for role in sources if role in e.roles and not e.multi_role]
+        an.warnings = []
         multi = [e for e in chosen if e.multi_role]
         for eng in multi:
             check()
-            progress(0.65, f"{eng.name}…")
-            errors = []
-            result = run_engine(eng, song, sources["mix"], features.ANALYSIS_SR, "mix")
+            progress(0.65, f"{eng.name}: вся песня… (первый запуск скачивает модель)")
+            result = run_engine(eng, song, sources["mix"], features.ANALYSIS_SR, "mix", an.warnings)
             if isinstance(result, tuple):
                 result = {}
             for role, (ghosts, heat) in result.items():
@@ -193,7 +193,7 @@ def run_analysis(project: Project, opt: AnalysisOptions, progress: Callable[[flo
             path = song if role == "mix" else stems.get(role)
             if path is None:
                 continue
-            ghosts, heat = run_engine(eng, path, sources[role], features.ANALYSIS_SR, role)
+            ghosts, heat = run_engine(eng, path, sources[role], features.ANALYSIS_SR, role, an.warnings)
             an.ghosts[f"{role}:{eng.id}"] = ghosts
             if heat is not None:
                 an.images[f"heat:{role}:{eng.id}"] = heat

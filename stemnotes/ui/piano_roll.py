@@ -253,6 +253,40 @@ class PianoRoll(QWidget):
         self.selected.clear()
         self._commit()
 
+    def import_ghosts(self, engine_ids: set[str] | None, only_loop: bool = False, snap: bool = True) -> int:
+        """Copy ghost notes (seconds) of the active source into the active track as editable notes (beats)."""
+        if self.track is None or self.project is None:
+            return 0
+        role = self.active_source()
+        groups = self.project.analysis.ghosts_for(role or "", engine_ids)
+        if not groups:
+            return 0
+        self.push_undo()
+        base = len(self.track.notes)
+        a, b = (self.loop_a, self.loop_b) if (only_loop and self.loop_b > self.loop_a) else (None, None)
+        seen: set[tuple[float, int]] = set()
+        for _eng, ghosts in groups:
+            for g in ghosts:
+                if g.conf >= 0 and g.conf < self.layers.ghost_min_conf:
+                    continue
+                if a is not None and (g.end <= a or g.start >= b):
+                    continue
+                start = self.project.sec_to_beat(g.start)
+                end = self.project.sec_to_beat(g.end)
+                if snap and self.snap > 0:
+                    start = self.snap_beat(start)
+                    end = max(start + self.snap, self.snap_beat(end))
+                key = (round(start, 3), g.pitch)
+                if key in seen:
+                    continue
+                seen.add(key)
+                vel = 100 if g.conf < 0 else int(60 + 67 * min(1.0, g.conf))
+                self.track.notes.append(Note(float(start), float(max(0.05, end - start)), int(g.pitch), vel))
+        added = len(self.track.notes) - base
+        self.selected = set(range(base, base + added))
+        self._commit()
+        return added
+
     def _commit(self) -> None:
         if self.track is None:
             return

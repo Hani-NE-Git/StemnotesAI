@@ -127,6 +127,7 @@ def run_crepe(path: Path, mono: np.ndarray, sr: int, role: str):
     import torchcrepe
     import soxr
     fmin, fmax = ROLE_RANGE.get(role, (50.0, 2000.0))
+    fmin = max(fmin, 33.0)   # CREPE's lowest bin is ~32.7 Hz; a lower fmin masks every bin and yields NaN
     audio16 = soxr.resample(mono.astype(np.float32), sr, 16000).astype(np.float32)
     x = torch.from_numpy(audio16)[None, :]
     hop = 160  # 10 ms
@@ -201,7 +202,7 @@ def _muscriptor_model():
     token = st.get("hf_token")
     if token:
         os.environ["HF_TOKEN"] = token
-    size = st.get("muscriptor_model") or "medium"
+    size = st.get("muscriptor_model") or ("large" if _device() == "cuda" else "medium")
     key = (size, _device())
     if key not in _musc_cache:
         from muscriptor import TranscriptionModel
@@ -260,6 +261,12 @@ def run_drums_heuristic(path: Path, mono: np.ndarray, sr: int, role: str):
 
 
 ENGINES: list[Engine] = [
+    Engine("muscriptor", "MuScriptor (вся песня)", "pitched", ["mix", "bass", "drums", "guitar", "piano", "vocals", "other"], (255, 110, 220),
+           "Основной движок. Kyutai/Mirelo: один проход по оригиналу, ноты раскладываются по инструментам, включая ударные. "
+           "Нужен HF-токен и принятая лицензия модели (некоммерческая).", ["muscriptor", "torch"], run_muscriptor_mix, multi_role=True),
+    Engine("muscriptor_stem", "MuScriptor (по стемам)", "pitched", ["bass", "drums", "guitar", "piano", "vocals"], (200, 120, 255),
+           "MuScriptor отдельно на каждом стеме с ограничением по инструменту. Точнее на плотных миксах, дольше.",
+           ["muscriptor", "torch"], run_muscriptor_stem, default_on=False),
     Engine("basic_pitch", "Basic Pitch (Spotify)", "pitched", list(PITCHED_ROLES), (255, 200, 60),
            "Полифония, любой инструмент. Даёт несколько кандидатов и карту вероятностей.", ["basic_pitch", "onnxruntime"], run_basic_pitch),
     Engine("crepe", "CREPE (монофония)", "pitched", ["bass", "vocals"], (120, 220, 255),
@@ -268,12 +275,6 @@ ENGINES: list[Engine] = [
            "Классический алгоритм для одноголосных партий. Быстрый, без моделей.", ["librosa"], run_pyin, default_on=False),
     Engine("piano_bytedance", "Piano Transcription (ByteDance)", "pitched", ["piano"], (255, 120, 90),
            "Лучшая модель для фортепиано. Первый запуск скачивает ~170 МБ в models.", ["piano_transcription_inference", "torch"], run_piano_bytedance),
-    Engine("muscriptor", "MuScriptor (вся песня)", "pitched", ["mix", "bass", "drums", "guitar", "piano", "vocals", "other"], (255, 110, 220),
-           "Kyutai/Mirelo: один проход по оригиналу, ноты раскладываются по инструментам, включая ударные. "
-           "Нужен HF-токен и принятая лицензия модели (некоммерческая).", ["muscriptor", "torch"], run_muscriptor_mix, multi_role=True),
-    Engine("muscriptor_stem", "MuScriptor (по стемам)", "pitched", ["bass", "drums", "guitar", "piano", "vocals"], (200, 120, 255),
-           "MuScriptor отдельно на каждом стеме с ограничением по инструменту. Точнее на плотных миксах, дольше.",
-           ["muscriptor", "torch"], run_muscriptor_stem, default_on=False),
     Engine("drums_heuristic", "Ударные: детектор ударов", "drums", ["drums"], (255, 200, 60),
            "Поиск ударов + классификация бочка/малый/хэт/тарелка по спектру.", ["librosa"], run_drums_heuristic),
 ]
@@ -285,9 +286,12 @@ def engine_color(engine_id: str) -> tuple[int, int, int]:
     return e.color if e else (255, 200, 60)
 
 
-def run_engine(engine: Engine, path: Path, mono: np.ndarray, sr: int, role: str):
+def run_engine(engine: Engine, path: Path, mono: np.ndarray, sr: int, role: str, errors: list[str] | None = None):
     try:
         return engine.run(path, mono, sr, role)
-    except Exception:
+    except Exception as e:
         traceback.print_exc()
+        if errors is not None:
+            msg = str(e).strip().splitlines()
+            errors.append(f"{engine.name}: " + (msg[0] if msg else type(e).__name__) + ("\n   " + "\n   ".join(msg[1:8]) if len(msg) > 1 else ""))
         return ({}, None) if engine.multi_role else ([], None)

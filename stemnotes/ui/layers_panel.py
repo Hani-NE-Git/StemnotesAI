@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget
 
 from .piano_roll import Layer, LayerSettings
 from .track_panel import SOURCE_LABELS
@@ -39,6 +39,7 @@ class LayerRow(QWidget):
 
 class LayersPanel(QWidget):
     changed = Signal()
+    import_requested = Signal(object, bool, bool)   # engine ids (set or None), only loop region, snap to grid
 
     def __init__(self, settings: LayerSettings, parent=None):
         super().__init__(parent)
@@ -93,6 +94,20 @@ class LayersPanel(QWidget):
         hrow.addWidget(QLabel("Карта:"))
         hrow.addWidget(self.heat_combo, 1)
         self.eng_lay.addLayout(hrow)
+        imp = QGroupBox("Перенести в дорожку")
+        il = QVBoxLayout(imp)
+        self.imp_engine = QComboBox()
+        self.imp_engine.setToolTip("Чьи призрачные ноты скопировать в активную MIDI-дорожку как обычные ноты (потом правите руками)")
+        il.addWidget(self.imp_engine)
+        self.imp_loop = QCheckBox("Только участок цикла")
+        self.imp_snap = QCheckBox("Привязать к сетке")
+        self.imp_snap.setChecked(True)
+        il.addWidget(self.imp_loop)
+        il.addWidget(self.imp_snap)
+        self.imp_btn = QPushButton("Скопировать ноты в дорожку")
+        self.imp_btn.clicked.connect(self._on_import)
+        il.addWidget(self.imp_btn)
+        self.eng_lay.addWidget(imp)
         self.eng_hint = QLabel("Запустите «ИИ-анализ», чтобы появились кандидаты нот.")
         self.eng_hint.setStyleSheet("color:#8a93a5;")
         self.eng_hint.setWordWrap(True)
@@ -144,6 +159,14 @@ class LayersPanel(QWidget):
             cb.toggled.connect(self._on_engines)
             self.eng_checks[eid] = cb
             self.eng_lay.addWidget(cb)
+        self.imp_engine.clear()
+        self.imp_engine.addItem("Все включённые движки", None)
+        for eid in engine_ids:
+            e = ENGINE_BY_ID.get(eid)
+            self.imp_engine.addItem(e.name if e else eid, eid)
+        pref = self.imp_engine.findData("muscriptor")
+        if pref > 0:
+            self.imp_engine.setCurrentIndex(pref)
         self.heat_combo.blockSignals(True)
         self.heat_combo.clear()
         self.heat_combo.addItem("Авто", None)
@@ -153,6 +176,11 @@ class LayersPanel(QWidget):
         idx = self.heat_combo.findData(self.s.heat_engine)
         self.heat_combo.setCurrentIndex(max(0, idx))
         self.heat_combo.blockSignals(False)
+
+    def _on_import(self) -> None:
+        eid = self.imp_engine.currentData()
+        engines = {eid} if eid else self.s.ghost_engines
+        self.import_requested.emit(engines, self.imp_loop.isChecked(), self.imp_snap.isChecked())
 
     def _on_engines(self, _v=None) -> None:
         on = {eid for eid, cb in self.eng_checks.items() if cb.isChecked()}

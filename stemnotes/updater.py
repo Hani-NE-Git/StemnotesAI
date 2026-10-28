@@ -161,6 +161,9 @@ def apply_zip(data: bytes, progress: Progress) -> dict:
 def install_requirements(progress: Progress, ai: bool | None = None) -> None:
     """pip install for changed requirement files (fast no-op when everything is already satisfied)."""
     home = paths.HOME
+    # compiled numba caches from the previous library set can crash the new one
+    for d in paths.CACHE_DIR.glob("numba*"):
+        shutil.rmtree(d, ignore_errors=True)
     py = sys.executable
     cmds = [[py, "-m", "pip", "install", "--no-warn-script-location", "-q", "-r", str(home / "requirements-base.txt")],
             [py, "-m", "pip", "install", "--no-warn-script-location", "-q", "--no-deps", "tinysoundfont"]]

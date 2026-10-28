@@ -29,7 +29,13 @@ def setup_model_env() -> None:
     os.environ.setdefault("HF_HOME", str(MODELS_DIR / "huggingface"))
     os.environ.setdefault("HF_HUB_CACHE", str(MODELS_DIR / "huggingface" / "hub"))
     os.environ.setdefault("XDG_CACHE_HOME", str(CACHE_DIR))
-    os.environ.setdefault("NUMBA_CACHE_DIR", str(CACHE_DIR / "numba"))
+    # numba's on-disk cache must not outlive a numba/llvmlite upgrade (stale entries segfault), so key it by version
+    try:
+        from importlib.metadata import version as _ver
+        numba_tag = "numba-" + _ver("numba")
+    except Exception:
+        numba_tag = "numba"
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(CACHE_DIR / numba_tag))
     os.environ.setdefault("LIBROSA_CACHE_DIR", str(CACHE_DIR / "librosa"))
     os.environ.setdefault("MPLCONFIGDIR", str(CACHE_DIR / "mpl"))
     for key in ("TORCH_HOME", "HF_HOME", "HF_HUB_CACHE", "NUMBA_CACHE_DIR", "LIBROSA_CACHE_DIR", "MPLCONFIGDIR"):

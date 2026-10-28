@@ -115,6 +115,7 @@ class Analysis:
         self.images: dict[str, PitchImage] = {}   # key like "spec:bass", "heat:bass"
         self.beats: list[float] = []
         self.sources: list[str] = []              # roles that have data (mix, bass, drums, ...)
+        self.warnings: list[str] = []             # last analysis run problems (not saved)
 
     def load(self) -> None:
         meta = self.dir / "analysis.json"

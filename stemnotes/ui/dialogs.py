@@ -227,6 +227,9 @@ class AnalysisDialog(QDialog):
             self.timer.stop()
             err = self._done
             if err is None:
+                warns = list(getattr(self.project.analysis, "warnings", []))
+                if warns:
+                    QMessageBox.warning(self, "Анализ завершён с замечаниями", "Часть движков не отработала:\n\n" + "\n\n".join(warns))
                 self.finished_ok.emit()
                 self.accept()
             else:

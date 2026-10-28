@@ -91,6 +91,7 @@ class MainWindow(QMainWindow):
         dock_r.setMinimumWidth(300)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock_r)
         self.layers.changed.connect(self.roll.invalidate)
+        self.layers.import_requested.connect(self._import_ghosts)
 
         self._build_toolbar()
         self.statusBar().showMessage("Готово")
@@ -446,6 +447,13 @@ class MainWindow(QMainWindow):
         t = self.project.track_by_id(tid)
         self.roll.set_track(t)
         self.vst_btn.setEnabled(t is not None and t.kind == "midi" and t.instrument.get("type") == "vst3")
+
+    def _import_ghosts(self, engines, only_loop: bool, snap: bool) -> None:
+        if self.project is None or self.roll.track is None:
+            self.statusBar().showMessage("Выберите MIDI-дорожку, в которую скопировать ноты", 4000)
+            return
+        n = self.roll.import_ghosts(engines, only_loop, snap)
+        self.statusBar().showMessage(f"Скопировано нот: {n} (Ctrl+Z — отменить)", 5000)
 
     def _choose_instrument(self, tid: str) -> None:
         t = self.project.track_by_id(tid) if self.project else None
