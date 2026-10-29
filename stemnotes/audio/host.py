@@ -22,6 +22,8 @@ class AudioHost:
         self.block = 1024
         self.master = 0.9
         self.vst_tracks: dict[str, str] = {}      # track id -> plugin name (mirrors the server)
+        self.sync_pending = False
+        self.editor_open = False
         self.project: Project | None = None
         self._events: queue.Queue = queue.Queue()
         self._ids = itertools.count(1)
@@ -186,7 +188,9 @@ class AudioHost:
             return
 
         def done(r, err):
-            if err:
+            if err == "editor_open":
+                self.sync_pending = True          # re-sent by the UI when the plugin window closes
+            elif err:
                 self._events.put(("error", {"message": err}))
             elif r:
                 self.vst_tracks = r.get("vst_tracks", {})
@@ -257,13 +261,19 @@ class AudioHost:
             self._events.put(("editor_closed", {"track_id": track_id, **r}))
             return
 
+        self.editor_open = True
+
         def work():
             try:
                 r = self.call("show_editor", track_id=track_id, timeout=None)
             except Exception as e:
                 r = {"ok": False, "error": str(e)}
+            self.editor_open = False
             self._events.put(("editor_closed", {"track_id": track_id, **r}))
         threading.Thread(target=work, daemon=True).start()
+
+    def close_editor(self) -> None:
+        self.call("close_editor", wait=False)
 
     def test_vst(self, track_id: str) -> dict:
         return self.call("test_vst", track_id=track_id, timeout=300)

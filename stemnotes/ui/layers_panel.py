@@ -6,7 +6,7 @@ from PySide6.QtWidgets import QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBo
 
 from .piano_roll import Layer, LayerSettings
 from .track_panel import SOURCE_LABELS
-from ..analysis.engines import ENGINE_BY_ID, engine_color
+from ..analysis.engines import ENGINE_BY_ID, engine_color, engine_label, engine_description
 
 
 class LayerRow(QWidget):
@@ -160,20 +160,19 @@ class LayersPanel(QWidget):
         self.eng_checks.clear()
         self.eng_hint.setVisible(not engine_ids)
         for eid in engine_ids:
-            e = ENGINE_BY_ID.get(eid)
             r, g, b = engine_color(eid)
-            cb = QCheckBox(e.name if e else eid)
+            cb = QCheckBox(("    " if "/" in eid else "") + engine_label(eid))
             cb.setStyleSheet(f"QCheckBox{{color:rgb({r},{g},{b});}}")
-            cb.setToolTip(e.description if e else "")
-            cb.setChecked(self.s.ghost_engines is None or eid in self.s.ghost_engines)
+            cb.setToolTip(engine_description(eid))
+            # group variants start off (the combined set is on), so nothing is drawn twice
+            cb.setChecked((self.s.ghost_engines is None and "/" not in eid) or (self.s.ghost_engines is not None and eid in self.s.ghost_engines))
             cb.toggled.connect(self._on_engines)
             self.eng_checks[eid] = cb
             self.eng_lay.addWidget(cb)
         self.imp_engine.clear()
         self.imp_engine.addItem("Все включённые движки", None)
         for eid in engine_ids:
-            e = ENGINE_BY_ID.get(eid)
-            self.imp_engine.addItem(e.name if e else eid, eid)
+            self.imp_engine.addItem(engine_label(eid), eid)
         pref = self.imp_engine.findData("muscriptor")
         if pref > 0:
             self.imp_engine.setCurrentIndex(pref)
@@ -181,8 +180,8 @@ class LayersPanel(QWidget):
         self.heat_combo.clear()
         self.heat_combo.addItem("Авто", None)
         for eid in engine_ids:
-            e = ENGINE_BY_ID.get(eid)
-            self.heat_combo.addItem(e.name if e else eid, eid)
+            if "/" not in eid:
+                self.heat_combo.addItem(engine_label(eid), eid)
         idx = self.heat_combo.findData(self.s.heat_engine)
         self.heat_combo.setCurrentIndex(max(0, idx))
         self.heat_combo.blockSignals(False)
@@ -194,7 +193,7 @@ class LayersPanel(QWidget):
 
     def _on_engines(self, _v=None) -> None:
         on = {eid for eid, cb in self.eng_checks.items() if cb.isChecked()}
-        self.s.ghost_engines = None if len(on) == len(self.eng_checks) else on
+        self.s.ghost_engines = on
         self._emit()
 
     def _on_heat_engine(self, _i) -> None:

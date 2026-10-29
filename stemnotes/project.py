@@ -151,8 +151,14 @@ class Analysis:
         out = []
         for key, g in self.ghosts.items():
             r, _, eng = key.partition(":")
-            if r == role and (engines is None or eng in engines):
-                out.append((eng, g))
+            if r != role:
+                continue
+            if engines is None:
+                if "/" in eng:
+                    continue        # default: combined sets only, not the per-group variants
+            elif eng not in engines:
+                continue
+            out.append((eng, g))
         return out
 
     def engines_for(self, role: str | None = None) -> list[str]:

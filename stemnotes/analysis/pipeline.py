@@ -206,6 +206,14 @@ def run_analysis(project: Project, opt: AnalysisOptions, progress: Callable[[flo
             ghosts, heat = run_engine(eng, path, sources[role], features.ANALYSIS_SR, role, an.warnings)
             an.ghosts[f"{role}:{eng.id}"] = ghosts
             an.summary.append(f"{eng.name} → {STEM_LABELS.get(role, role)} ({path.name}): {len(ghosts)} нот")
+            # per-instrument-group variants (e.g. clean vs distorted guitar) as separately switchable sets
+            for key in [k for k in an.ghosts if k.startswith(f"{role}:{eng.id}/")]:
+                del an.ghosts[key]
+            extra = getattr(eng.run, "extra", None) or {}
+            for group, lst in extra.items():
+                an.ghosts[f"{role}:{eng.id}/{group}"] = lst
+            if hasattr(eng.run, "extra"):
+                eng.run.extra = {}
             if heat is not None:
                 an.images[f"heat:{role}:{eng.id}"] = heat
             elif f"heat:{role}:{eng.id}" in an.images:

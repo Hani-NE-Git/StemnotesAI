@@ -312,9 +312,22 @@ def stem_energy_confidence(ghosts: list[GhostNote], stem_mono: np.ndarray, sr: i
         g.conf = float(np.clip((db + 40.0) / 30.0, 0.05, 1.0))   # -10 dB → 1.0, -40 dB → ~0.05
 
 
+GROUP_LABELS = {
+    "acoustic_guitar": "акустика", "clean_electric_guitar": "чистая", "distorted_electric_guitar": "перегруз",
+    "acoustic_piano": "пианино", "electric_piano": "электропиано", "organ": "орган", "chromatic_percussion": "перкуссия",
+    "acoustic_bass": "контрабас/акуст.", "electric_bass": "электро", "contrabass": "контрабас", "voice": "голос", "drums": "ударные",
+}
+GROUP_COLORS = {
+    "acoustic_guitar": (255, 180, 90), "clean_electric_guitar": (120, 230, 255), "distorted_electric_guitar": (255, 90, 120),
+    "acoustic_piano": (255, 150, 90), "electric_piano": (150, 200, 255), "organ": (190, 255, 140), "chromatic_percussion": (255, 230, 120),
+    "acoustic_bass": (200, 170, 255), "electric_bass": (120, 160, 255), "contrabass": (230, 200, 255), "voice": (255, 200, 230), "drums": (255, 200, 60),
+}
+
+
 def run_muscriptor_stem(path: Path, mono: np.ndarray, sr: int, role: str):
     """Transcribe ONE separated stem file, constrained to that stem's instrument groups.
-    Silent parts of the stem are zeroed first so the model cannot invent notes from bleed."""
+    Silent parts of the stem are zeroed first so the model cannot invent notes from bleed.
+    Returns the combined list; per-group lists are attached as `extra` (see pipeline)."""
     import torch
     model = _muscriptor_model()
     groups = MUSC_ROLE_TO_GROUPS.get(role)
@@ -326,6 +339,7 @@ def run_muscriptor_stem(path: Path, mono: np.ndarray, sr: int, role: str):
     ghosts.sort(key=lambda x: x.start)
     stem_energy_confidence(ghosts, mono, sr)
     log.info("MuScriptor (stem) role=%s: %d notes, groups %s", role, len(ghosts), {k: len(v) for k, v in by_group.items()})
+    run_muscriptor_stem.extra = {g: lst for g, lst in by_group.items()} if len(by_group) > 1 else {}
     return ghosts, None
 
 
@@ -358,8 +372,24 @@ ENGINE_BY_ID = {e.id: e for e in ENGINES}
 
 
 def engine_color(engine_id: str) -> tuple[int, int, int]:
-    e = ENGINE_BY_ID.get(engine_id)
+    base, _, group = engine_id.partition("/")
+    if group:
+        return GROUP_COLORS.get(group, (200, 200, 200))
+    e = ENGINE_BY_ID.get(base)
     return e.color if e else (255, 200, 60)
+
+
+def engine_label(engine_id: str) -> str:
+    base, _, group = engine_id.partition("/")
+    e = ENGINE_BY_ID.get(base)
+    name = e.name if e else base
+    return f"{name}: {GROUP_LABELS.get(group, group)}" if group else name
+
+
+def engine_description(engine_id: str) -> str:
+    base, _, group = engine_id.partition("/")
+    e = ENGINE_BY_ID.get(base)
+    return (e.description if e else "") + (f"\nТолько ноты, которые модель отнесла к группе «{GROUP_LABELS.get(group, group)}»." if group else "")
 
 
 def run_engine(engine: Engine, path: Path, mono: np.ndarray, sr: int, role: str, errors: list[str] | None = None):

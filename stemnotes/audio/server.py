@@ -35,6 +35,7 @@ class AudioServer:
         self._notes_hash: dict[str, str] = {}
         self._audio_paths: dict[str, str] = {}
         self._tempo: tuple[float, float] = (0.0, 0.0)
+        self.editor_open = False
 
     # ------------------------------------------------------------------ dispatch
     def handle(self, cmd: dict):
@@ -145,6 +146,7 @@ class AudioServer:
         if v is None:
             return {"ok": False, "error": "на дорожке нет VST3-инструмента"}
         self.engine.stop()
+        self.editor_open = True
         try:
             log.info("opening VST3 editor for %s", v.name)
             v.show_editor()
@@ -152,6 +154,8 @@ class AudioServer:
         except Exception as e:
             log.exception("show_editor failed")
             return {"ok": False, "error": str(e)}
+        finally:
+            self.editor_open = False
         self.engine.mark_vst_dirty(track_id)
         self.engine.kick_vst_render()
         return {"ok": True, "state": v.get_state()}
@@ -161,6 +165,34 @@ class AudioServer:
         if t is None:
             return {"ok": False, "error": "дорожка не найдена"}
         return self.engine.test_vst(t)
+
+    def op_close_editor(self):
+        """Ask every top-level window of this process to close (the Pedalboard editor has no API for that)."""
+        import os
+        import sys
+        if not sys.platform.startswith("win"):
+            return {"ok": False, "error": "только Windows"}
+        import ctypes
+        import ctypes.wintypes as wt
+        user32 = ctypes.windll.user32
+        WM_CLOSE = 0x0010
+        pid = os.getpid()
+        closed = []
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+
+        def cb(hwnd, lparam):
+            wpid = wt.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if wpid.value == pid and user32.IsWindowVisible(hwnd):
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                closed.append(int(hwnd))
+            return True
+        user32.EnumWindows(EnumWindowsProc(cb), 0)
+        log.info("close_editor: WM_CLOSE sent to %d window(s)", len(closed))
+        return {"ok": True, "windows": len(closed)}
+
+    def op_editor_state(self):
+        return {"open": self.editor_open}
 
     def op_ping(self):
         return "pong"
@@ -219,7 +251,10 @@ def run_server(conn, shared) -> None:
                         stop.set()
                         break
                     if cmd.get("op") in PLUGIN_OPS:
-                        plugin_queue.put((cid, cmd))
+                        if server.editor_open:
+                            send(("reply", cid, {"ok": False, "error": "editor_open"}))
+                        else:
+                            plugin_queue.put((cid, cmd))
                     else:
                         execute(cid, cmd)
                 for name, payload in server.drain_events():

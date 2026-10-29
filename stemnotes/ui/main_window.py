@@ -482,6 +482,10 @@ class MainWindow(QMainWindow):
         elif name == "vst_rendered":
             self.statusBar().showMessage("VST3-дорожка отрендерена", 2000)
         elif name == "editor_closed":
+            self.vst_btn.setText("Окно VST")
+            if self.engine.sync_pending:
+                self.engine.sync_pending = False
+                self.engine.sync()
             tid = payload.get("track_id")
             t = self.project.track_by_id(tid) if self.project else None
             if not payload.get("ok"):
@@ -549,6 +553,9 @@ class MainWindow(QMainWindow):
         if dlg.exec() != InstrumentDialog.DialogCode.Accepted or not dlg.result_instrument:
             return
         inst = dlg.result_instrument
+        if inst["type"] == "vst3" and self.engine.editor_open:
+            QMessageBox.information(self, "VST3", "Сначала закройте окно открытого плагина (кнопка «Закрыть окно VST»).")
+            return
         if inst["type"] != "vst3":
             t.instrument = inst
             self.engine.sync()
@@ -589,15 +596,23 @@ class MainWindow(QMainWindow):
         self.engine.call_async("vst_names", names_done, path=inst["path"])
 
     def open_vst_editor(self) -> None:
+        if self.engine.editor_open:
+            self.engine.close_editor()
+            self.statusBar().showMessage("Окну плагина отправлена команда закрытия", 3000)
+            return
         tid = self.tracks.active_id
         if not tid or not self.engine.has_vst(tid):
             self.statusBar().showMessage("У активной дорожки нет VST3-инструмента (кнопка инструмента → вкладка VST3)", 4000)
             return
         self.engine.stop()
-        self.statusBar().showMessage("Окно плагина открыто в аудиопроцессе. Закройте его, чтобы применить настройки.", 6000)
+        self.vst_btn.setText("Закрыть окно VST")
+        self.statusBar().showMessage("Окно плагина открыто. Пока оно открыто, другие операции с плагинами ждут.", 6000)
         self.engine.show_editor(tid)
 
     def test_vst(self) -> None:
+        if self.engine.editor_open:
+            QMessageBox.information(self, "VST3", "Сначала закройте окно открытого плагина.")
+            return
         tid = self.tracks.active_id
         if not tid or not self.engine.has_vst(tid):
             self.statusBar().showMessage("У активной дорожки нет VST3-инструмента", 4000)
