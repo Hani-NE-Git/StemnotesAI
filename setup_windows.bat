@@ -45,6 +45,11 @@ if not exist soundfonts\GeneralUser-GS.sf2 (
     curl -L -o soundfonts\GeneralUser-GS.sf2 https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/main/GeneralUser-GS.sf2
 )
 
+echo [4b] Downloading native audio host (VST3 support) ...
+if not exist bin mkdir bin
+curl -L -o bin\stemnotes-host-windows.zip https://github.com/Hani-NE-Git/StemnotesAI/releases/download/host-latest/stemnotes-host-windows.zip && tar -xf bin\stemnotes-host-windows.zip -C bin && del bin\stemnotes-host-windows.zip
+if not exist bin\stemnotes-host.exe echo (host not available yet - the app will offer to download it later)
+
 set AI=%1
 if "%AI%"=="" (
     set /p AI="[5/5] Install AI module (PyTorch CUDA 12.8 + Demucs + Basic Pitch, ~3.5 GB download)? [Y/n]: "

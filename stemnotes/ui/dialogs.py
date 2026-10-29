@@ -313,8 +313,9 @@ class SettingsDialog(QDialog):
         self.buf.setCurrentIndex(max(0, self.buf.findData(settings.get("block", engine.block))))
         self.buf.setToolTip("Больше буфер — меньше хрипов и щелчков, но больше задержка при прослушивании нот")
         lay.addRow("Буфер:", self.buf)
-        status = QLabel(("Работает, %d Гц, буфер %d, отдельный аудиопроцесс: %s" % (engine.sample_rate, engine.block, "да" if not engine.inprocess else "нет"))
-                        if engine.available else f"Нет звука: {engine.error}")
+        backend = "нативный хост stemnotes-host (C++)" if engine.__class__.__name__ == "NativeHost" else ("Python, отдельный процесс" if not engine.inprocess else "Python, в одном процессе")
+        status = QLabel(("Работает, %d Гц, буфер %d, движок: %s" % (engine.sample_rate, engine.block, backend))
+                        if engine.available else f"Нет звука: {engine.error} (движок: {backend})")
         status.setWordWrap(True)
         lay.addRow("Состояние:", status)
         lay.addRow(QLabel("Используется общий режим (без ASIO и без захвата устройства)."))
@@ -485,3 +486,40 @@ class UpdateDialog(QDialog):
             subprocess.Popen(args, cwd=str(paths.HOME), close_fds=True)
             os._exit(0)
         os.execv(sys.executable, args)
+
+
+class FuncProgressDialog(QDialog):
+    """Runs fn(progress) in a thread with a progress bar; .error holds the failure text."""
+
+    def __init__(self, title: str, fn, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(460, 120)
+        lay = QVBoxLayout(self)
+        self.lbl = QLabel("…")
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        lay.addWidget(self.lbl)
+        lay.addWidget(self.bar)
+        self._p = (0.0, "")
+        self._done = False
+        self.error: str | None = None
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._poll)
+        self.timer.start(100)
+
+        def work():
+            try:
+                fn(lambda f, m: setattr(self, "_p", (f, m)))
+            except Exception as e:
+                self.error = str(e)
+            self._done = True
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll(self) -> None:
+        f, m = self._p
+        self.bar.setValue(int(f * 1000))
+        self.lbl.setText(m)
+        if self._done:
+            self.timer.stop()
+            self.accept()

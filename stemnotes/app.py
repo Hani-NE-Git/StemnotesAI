@@ -64,7 +64,28 @@ def main(argv: list[str] | None = None) -> int:
     _sys.excepthook = _hook
 
     settings = load_settings()
-    engine = AudioHost(inprocess=bool(settings.get("audio_inprocess", False)))
+    engine = None
+    backend = settings.get("audio_backend", "native")
+    if backend == "native":
+        from .audio import native_host, host_download
+        if not host_download.host_up_to_date():
+            r = QMessageBox.question(None, "Аудиохост", "Для звука и VST3 нужен нативный аудиохост (stemnotes-host, ~7 МБ).\n"
+                                     "Скачать его из GitHub в папку bin?")
+            if r == QMessageBox.StandardButton.Yes:
+                from .ui.dialogs import FuncProgressDialog
+                dlg = FuncProgressDialog("Аудиохост", host_download.download_host)
+                dlg.exec()
+                if dlg.error:
+                    QMessageBox.warning(None, "Аудиохост", f"Не удалось скачать:\n{dlg.error}\n\nБудет использован встроенный звуковой движок (без VST3).")
+        if native_host.host_exe() is not None:
+            try:
+                engine = native_host.NativeHost()
+            except Exception as e:
+                _log.error("native host failed to start: %s", e)
+                QMessageBox.warning(None, "Аудиохост", f"stemnotes-host не запустился:\n{e}\n\nБудет использован встроенный звуковой движок (без VST3).")
+                engine = None
+    if engine is None:
+        engine = AudioHost(inprocess=bool(settings.get("audio_inprocess", False)))
     try:
         engine.start(settings.get("device"), settings.get("block"))
     except Exception as e:

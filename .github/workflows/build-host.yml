@@ -1,0 +1,63 @@
+name: build-host
+
+on:
+  push:
+    branches: [main]
+    paths: ["host/**", ".github/workflows/build-host.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S host -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release --target stemnotes-host
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/stemnotes-host_artefacts/Release/stemnotes-host.exe dist/
+          Copy-Item host/VERSION dist/host-version.txt
+          Compress-Archive -Path dist/* -DestinationPath stemnotes-host-windows.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stemnotes-host-windows
+          path: stemnotes-host-windows.zip
+      - name: Publish to release "host-latest"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release view host-latest >/dev/null 2>&1 || gh release create host-latest --title "Native audio host (latest build)" --notes "Automatic build of host/ (stemnotes-host). The app downloads this on first start." 
+          gh release upload host-latest stemnotes-host-windows.zip --clobber
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libasound2-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxext-dev libfreetype6-dev libfontconfig1-dev libgl1-mesa-dev libcurl4-openssl-dev
+      - name: Configure
+        run: cmake -S host -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --target stemnotes-host
+      - name: Package
+        run: |
+          mkdir -p dist && cp build/stemnotes-host_artefacts/Release/stemnotes-host dist/ && cp host/VERSION dist/host-version.txt
+          cd dist && tar czf ../stemnotes-host-linux.tar.gz *
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stemnotes-host-linux
+          path: stemnotes-host-linux.tar.gz
+      - name: Publish to release "host-latest"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view host-latest >/dev/null 2>&1 || gh release create host-latest --title "Native audio host (latest build)" --notes "Automatic build of host/ (stemnotes-host)."
+          gh release upload host-latest stemnotes-host-linux.tar.gz --clobber
