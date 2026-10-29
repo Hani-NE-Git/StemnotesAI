@@ -3,7 +3,10 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <atomic>
+#include <functional>
 #include <map>
+#include <set>
+#include <string>
 #include <memory>
 #include <vector>
 

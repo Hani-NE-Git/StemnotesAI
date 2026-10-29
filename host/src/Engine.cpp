@@ -2,7 +2,10 @@
 #include "tsf.h"
 #include "Engine.h"
 #include <algorithm>
+#include <map>
+#include <set>
 #include <thread>
+#include <vector>
 
 using namespace juce;
 namespace sn {
