@@ -2,17 +2,19 @@
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "Engine.h"
 #include "Commands.h"
+#include "StdioGuard.h"
 #include <cstdio>
 #include <iostream>
 #include <string>
 
 using namespace juce;
 
+static FILE* proto = stdout;   // protocol channel (the original stdout)
 static CriticalSection outLock;
 static void writeLine(const var& v) {
     const ScopedLock sl(outLock);
     String s = JSON::toString(v, true);
-    std::fputs(s.toRawUTF8(), stdout); std::fputc('\n', stdout); std::fflush(stdout);
+    std::fputs(s.toRawUTF8(), proto); std::fputc('\n', proto); std::fflush(proto);
 }
 static void sendEvent(const String& name, const var& payload) {
     auto* o = new DynamicObject();
@@ -35,6 +37,7 @@ public:
 };
 
 int main(int argc, char** argv) {
+    proto = sn::takeProtocolStdout();
     ScopedJuceInitialiser_GUI juceInit;
     std::fprintf(stderr, "stemnotes-host %s starting\n", STEMNOTES_HOST_VERSION);
     sn::Engine engine;
@@ -78,7 +81,7 @@ int main(int argc, char** argv) {
     reader.signalThreadShouldExit();
     engine.shutdown();
     std::fprintf(stderr, "stemnotes-host exiting\n");
-    std::fflush(stdout); std::fflush(stderr);
+    std::fflush(proto); std::fflush(stdout); std::fflush(stderr);
     // the stdin reader may be blocked in getline(); do not wait for it
     std::_Exit(0);
 }

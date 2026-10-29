@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.22)
-project(StemNotesHost VERSION 0.1.0 LANGUAGES C CXX)
+# host/VERSION is the single source: the app compares it with bin/host-version.txt to offer a new download
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" HOST_VERSION LIMIT_COUNT 1)
+string(STRIP "${HOST_VERSION}" HOST_VERSION)
+project(StemNotesHost VERSION ${HOST_VERSION} LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
@@ -16,7 +19,7 @@ else()
 endif()
 
 juce_add_console_app(stemnotes-host PRODUCT_NAME "stemnotes-host")
-target_sources(stemnotes-host PRIVATE src/Main.cpp src/Engine.cpp src/Commands.cpp)
+target_sources(stemnotes-host PRIVATE src/Main.cpp src/Engine.cpp src/Commands.cpp src/StdioGuard.cpp)
 target_include_directories(stemnotes-host PRIVATE third_party src)
 target_compile_definitions(stemnotes-host PRIVATE
   JUCE_PLUGINHOST_VST3=1

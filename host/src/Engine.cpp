@@ -346,7 +346,9 @@ void Engine::preparePlugin(MidiTrack& t) {
     if (!t.plugin) return;
     t.plugin->setRateAndBufferSizeDetails(sr, block);
     t.plugin->prepareToPlay(sr, block);
-    t.scratch.setSize(jmax(2, t.plugin->getTotalNumOutputChannels()), jmax(block, 512) * 2);
+    // processBlock needs room for every active input and output channel (e.g. a sidechain input)
+    const int chans = jmax(2, t.plugin->getTotalNumInputChannels(), t.plugin->getTotalNumOutputChannels());
+    t.scratch.setSize(chans, jmax(block, 512) * 2);
 }
 
 void Engine::loadPlugin(const String& trackId, const String& path, const String& name, std::function<void(bool, String)> done) {
@@ -362,7 +364,9 @@ void Engine::loadPlugin(const String& trackId, const String& path, const String&
     logLine("loading plugin " + chosen.name + " from " + path);
     formatManager.createPluginInstanceAsync(chosen, sr, block, [this, trackId, done, path, name](std::unique_ptr<AudioPluginInstance> inst, const String& err) {
         if (!inst) { logLine("plugin load failed: " + err); done(false, err); return; }
-        inst->enableAllBuses();
+        // Keep the plugin's default bus layout (main stereo out). Enabling every bus made EZdrummer render
+        // 32 output channels of which only the first two are mixed.
+        if (inst->getTotalNumOutputChannels() == 0) inst->enableAllBuses();
         {
             const ScopedLock sl(lock);
             for (auto& t : midiTracks) if (t->id == trackId) {
@@ -373,7 +377,7 @@ void Engine::loadPlugin(const String& trackId, const String& path, const String&
                 }
                 t->plugin = std::move(inst);
                 preparePlugin(*t);
-                logLine("plugin ready: " + t->plugin->getName() + " outs=" + String(t->plugin->getTotalNumOutputChannels()) + " latency=" + String(t->plugin->getLatencySamples()));
+                logLine("plugin ready: " + t->plugin->getName() + " ins=" + String(t->plugin->getTotalNumInputChannels()) + " outs=" + String(t->plugin->getTotalNumOutputChannels()) + " latency=" + String(t->plugin->getLatencySamples()));
                 done(true, {});
                 return;
             }
