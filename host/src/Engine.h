@@ -41,6 +41,7 @@ struct MidiTrack {
     std::vector<ActiveNote> active;
     juce::MidiBuffer pending;               // preview / immediate events for the next block (message thread -> callback)
     juce::AudioBuffer<float> scratch;
+    std::vector<std::pair<int, int>> outBuses;   // (first channel, channel count) of every enabled output bus
     std::atomic<float> testPeak { 0.0f };
     bool testing = false;
 };

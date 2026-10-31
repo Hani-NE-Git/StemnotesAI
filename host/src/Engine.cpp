@@ -349,6 +349,12 @@ void Engine::preparePlugin(MidiTrack& t) {
     // processBlock needs room for every active input and output channel (e.g. a sidechain input)
     const int chans = jmax(2, t.plugin->getTotalNumInputChannels(), t.plugin->getTotalNumOutputChannels());
     t.scratch.setSize(chans, jmax(block, 512) * 2);
+    // every enabled output bus is mixed down, so a part routed to an extra output (EZdrummer: kick on out 3/4) is heard
+    t.outBuses.clear();
+    for (int b = 0; b < t.plugin->getBusCount(false); ++b)
+        if (auto* bus = t.plugin->getBus(false, b); bus != nullptr && bus->isEnabled() && bus->getNumberOfChannels() > 0)
+            t.outBuses.push_back({ bus->getChannelIndexInProcessBlockBuffer(0), bus->getNumberOfChannels() });
+    if (t.outBuses.empty()) t.outBuses.push_back({ 0, 2 });
 }
 
 void Engine::loadPlugin(const String& trackId, const String& path, const String& name, std::function<void(bool, String)> done) {
@@ -364,8 +370,7 @@ void Engine::loadPlugin(const String& trackId, const String& path, const String&
     logLine("loading plugin " + chosen.name + " from " + path);
     formatManager.createPluginInstanceAsync(chosen, sr, block, [this, trackId, done, path, name](std::unique_ptr<AudioPluginInstance> inst, const String& err) {
         if (!inst) { logLine("plugin load failed: " + err); done(false, err); return; }
-        // Keep the plugin's default bus layout (main stereo out). Enabling every bus made EZdrummer render
-        // 32 output channels of which only the first two are mixed.
+        // keep the plugin's own bus layout; only a plugin that starts with no active output gets all buses enabled
         if (inst->getTotalNumOutputChannels() == 0) inst->enableAllBuses();
         {
             const ScopedLock sl(lock);
@@ -377,7 +382,7 @@ void Engine::loadPlugin(const String& trackId, const String& path, const String&
                 }
                 t->plugin = std::move(inst);
                 preparePlugin(*t);
-                logLine("plugin ready: " + t->plugin->getName() + " ins=" + String(t->plugin->getTotalNumInputChannels()) + " outs=" + String(t->plugin->getTotalNumOutputChannels()) + " latency=" + String(t->plugin->getLatencySamples()));
+                logLine("plugin ready: " + t->plugin->getName() + " ins=" + String(t->plugin->getTotalNumInputChannels()) + " outs=" + String(t->plugin->getTotalNumOutputChannels()) + " out_buses=" + String((int) t->outBuses.size()) + " latency=" + String(t->plugin->getLatencySamples()));
                 done(true, {});
                 return;
             }
@@ -600,8 +605,9 @@ void Engine::renderSegment(int64_t p, int n, AudioBuffer<float>& out) {
         AudioBuffer<float> buf(t->scratch.getArrayOfWritePointers(), t->scratch.getNumChannels(), 0, n);
         buf.clear();
         if (!t->plugin->isSuspended()) t->plugin->processBlock(buf, midi);
-        if (t->testing) { float pk = 0; for (int c = 0; c < jmin(2, buf.getNumChannels()); ++c) pk = jmax(pk, buf.getMagnitude(c, 0, n)); t->testPeak = jmax(t->testPeak.load(), pk); }
-        if (aud) for (int c = 0; c < 2; ++c) out.addFrom(c, 0, buf, jmin(c, buf.getNumChannels() - 1), 0, n, t->volume);
+        if (t->testing) { float pk = 0; for (auto [first, count] : t->outBuses) for (int c = 0; c < count; ++c) pk = jmax(pk, buf.getMagnitude(first + c, 0, n)); t->testPeak = jmax(t->testPeak.load(), pk); }
+        if (aud) for (auto [first, count] : t->outBuses)
+            for (int c = 0; c < 2; ++c) out.addFrom(c, 0, buf, first + jmin(c, count - 1), 0, n, t->volume);
     }
 }
 
